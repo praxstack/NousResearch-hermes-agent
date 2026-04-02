@@ -2079,6 +2079,18 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
 
+        # Vault Watcher: track which chat is active for file routing
+        try:
+            _vw_dir = Path("/tmp/hermes-active-chats")
+            _vw_dir.mkdir(exist_ok=True)
+            (_vw_dir / f"{source.chat_id}.json").write_text(
+                json.dumps({"chat_id": str(source.chat_id),
+                            "chat_name": getattr(source, "chat_name", ""),
+                            "ts": time.time()})
+            )
+        except Exception:
+            pass
+
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
@@ -2697,9 +2709,13 @@ class GatewayRunner:
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Emit agent:end hook
+            _hook_adapter = self.adapters.get(source.platform) if source.platform else None
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
+                "messages": agent_messages,
+                "adapter": _hook_adapter,
+                "chat_id": str(source.chat_id),
             })
             
             # Check for pending process watchers (check_interval on background processes)
