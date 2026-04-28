@@ -14,6 +14,7 @@ from agent.anthropic_adapter import (
     _to_plain_data,
     _write_claude_code_credentials,
     build_anthropic_client,
+    build_anthropic_bedrock_client,
     build_anthropic_kwargs,
     convert_messages_to_anthropic,
     convert_tools_to_anthropic,
@@ -141,6 +142,58 @@ class TestBuildAnthropicClient:
             assert kwargs["default_headers"] == {
                 "anthropic-beta": "interleaved-thinking-2025-05-14"
             }
+
+
+class TestBuildAnthropicBedrockClient:
+    def test_api_key_mode_passes_bedrock_api_key(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_bedrock_client(
+                "us-east-1",
+                auth_config={
+                    "method": "api_key",
+                    "api_key": "absk-test-token",
+                    "region": "us-east-1",
+                },
+            )
+
+        kwargs = mock_sdk.AnthropicBedrock.call_args[1]
+        assert kwargs["api_key"] == "absk-test-token"
+        assert kwargs["aws_region"] == "us-east-1"
+        assert "aws_profile" not in kwargs
+
+    def test_profile_mode_masks_ambient_bedrock_api_key(self, monkeypatch):
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "stale-absk-token")
+
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_bedrock_client(
+                "us-east-1",
+                auth_config={
+                    "method": "profile",
+                    "profile": "bedrock-dev",
+                    "region": "us-east-1",
+                },
+            )
+
+        kwargs = mock_sdk.AnthropicBedrock.call_args[1]
+        assert kwargs["aws_profile"] == "bedrock-dev"
+        assert "api_key" not in kwargs
+
+    def test_default_chain_masks_ambient_bedrock_api_key(self, monkeypatch):
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "stale-absk-token")
+
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_bedrock_client(
+                "us-east-1",
+                auth_config={
+                    "method": "default_chain",
+                    "region": "us-east-1",
+                },
+            )
+
+        kwargs = mock_sdk.AnthropicBedrock.call_args[1]
+        assert kwargs["aws_region"] == "us-east-1"
+        assert "api_key" not in kwargs
+        assert "aws_profile" not in kwargs
 
 
 class TestReadClaudeCodeCredentials:

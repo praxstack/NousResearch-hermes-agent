@@ -27,11 +27,11 @@ class TestProviderRegistry:
         pconfig = PROVIDER_REGISTRY["bedrock"]
         assert pconfig.auth_type == "aws_sdk"
 
-    def test_bedrock_has_no_api_key_env_vars(self):
-        """Bedrock uses the AWS SDK credential chain, not API keys."""
+    def test_bedrock_registers_bearer_token_env_var(self):
+        """Bedrock API-key mode is native Bedrock auth, not a custom provider."""
         from hermes_cli.auth import PROVIDER_REGISTRY
         pconfig = PROVIDER_REGISTRY["bedrock"]
-        assert pconfig.api_key_env_vars == ()
+        assert pconfig.api_key_env_vars == ("AWS_BEARER_TOKEN_BEDROCK",)
 
     def test_bedrock_base_url_env_var(self):
         from hermes_cli.auth import PROVIDER_REGISTRY

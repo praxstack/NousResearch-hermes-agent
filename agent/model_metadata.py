@@ -1275,7 +1275,22 @@ def get_model_context_length(
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
 
-    # 1. Check persistent cache (model+provider)
+    # 1. AWS Bedrock — use static context length table.
+    # Bedrock's ListFoundationModels doesn't expose context window sizes, and
+    # bedrock-runtime can look like a generic custom endpoint. Resolve it before
+    # endpoint probing or stale cache entries can collapse new models to 128K.
+    if provider == "bedrock" or (
+        base_url
+        and base_url_hostname(base_url).startswith("bedrock-runtime.")
+        and base_url_host_matches(base_url, "amazonaws.com")
+    ):
+        try:
+            from agent.bedrock_adapter import get_bedrock_context_length
+            return get_bedrock_context_length(model)
+        except ImportError:
+            pass  # boto3 not installed — fall through to generic resolution
+
+    # 2. Check persistent cache (model+provider)
     # LM Studio is excluded — its loaded context length is transient (the
     # user can reload the model with a different context_length at any time
     # via /api/v1/models/load), so a stale cached value would mask reloads.
@@ -1352,7 +1367,6 @@ def get_model_context_length(
             return ctx
 
     # 4b. (Bedrock handled earlier at step 1b — before custom-endpoint probe.)
-
     # 5. Provider-aware lookups (before generic OpenRouter cache)
     # These are provider-specific and take priority over the generic OR cache,
     # since the same model can have different context limits per provider

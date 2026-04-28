@@ -105,6 +105,41 @@ class TestSaveAndLoadRoundtrip:
             assert saved["agent"]["max_turns"] == 37
             assert "max_turns" not in saved
 
+    def test_save_config_drops_legacy_bedrock_proxy_entries(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({
+                "model": {
+                    "provider": "bedrock",
+                    "default": "global.anthropic.claude-opus-4-7",
+                    "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                },
+                "providers": {
+                    "bedrock-native": {
+                        "api": "http://localhost:8881",
+                        "name": "bedrock-native",
+                    },
+                    "kept-local": {
+                        "api": "http://localhost:11434/v1",
+                        "name": "kept-local",
+                    },
+                },
+                "custom_providers": [
+                    {
+                        "name": "bedrock-native",
+                        "base_url": "http://localhost:8881",
+                    },
+                    {
+                        "name": "kept-local",
+                        "base_url": "http://localhost:11434/v1",
+                    },
+                ],
+            })
+
+            saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            assert "bedrock-native" not in saved["providers"]
+            assert "kept-local" in saved["providers"]
+            assert [entry["name"] for entry in saved["custom_providers"]] == ["kept-local"]
+
     def test_nested_values_preserved(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config = load_config()

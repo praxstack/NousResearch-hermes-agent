@@ -398,6 +398,48 @@ def test_run_doctor_accepts_hermes_provider_ids_that_catalog_aliases(
         )
 
 
+def test_run_doctor_accepts_builtin_bedrock_provider(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".env").write_text("AWS_BEARER_TOKEN_BEDROCK=absk-test\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: bedrock\n"
+        "  default: global.anthropic.claude-opus-4-7\n"
+        "  base_url: https://bedrock-runtime.us-east-1.amazonaws.com\n"
+        "bedrock:\n"
+        "  region: us-east-1\n"
+        "  auth_method: api_key\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "model.provider 'bedrock' is not a recognised provider" not in out
+
+
 def test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)

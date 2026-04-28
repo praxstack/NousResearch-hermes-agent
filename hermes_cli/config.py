@@ -47,6 +47,8 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 _EXTRA_ENV_KEYS = frozenset({
     "OPENAI_API_KEY", "OPENAI_BASE_URL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
     "DISCORD_HOME_CHANNEL", "DISCORD_HOME_CHANNEL_NAME",
     "TELEGRAM_HOME_CHANNEL", "TELEGRAM_HOME_CHANNEL_NAME",
     "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
@@ -617,6 +619,8 @@ DEFAULT_CONFIG = {
     # Only used when model.provider is "bedrock".
     "bedrock": {
         "region": "",  # AWS region for Bedrock API calls (empty = AWS_REGION env var → us-east-1)
+        "auth_method": "default_chain",  # api_key | profile | credentials | default_chain
+        "profile": "",  # Used when auth_method == profile
         "discovery": {
             "enabled": True,           # Auto-discover models via ListFoundationModels
             "provider_filter": [],     # Only show models from these providers (e.g. ["anthropic", "amazon"])
@@ -3471,6 +3475,32 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _drop_legacy_bedrock_provider_entries(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove old first-party Bedrock proxy entries before persisting config."""
+    config = dict(config)
+
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        providers = dict(providers)
+        providers.pop("bedrock-native", None)
+        providers.pop("bedrock-mantle", None)
+        config["providers"] = providers
+
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, list):
+        config["custom_providers"] = [
+            entry
+            for entry in custom_providers
+            if not (
+                isinstance(entry, dict)
+                and str(entry.get("name") or "").strip()
+                in {"bedrock-native", "bedrock-mantle"}
+            )
+        ]
+
+    return config
+
+
 def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize legacy root-level max_turns into agent.max_turns."""
     config = dict(config)
@@ -3704,9 +3734,13 @@ def save_config(config: Dict[str, Any]):
 
     ensure_hermes_home()
     config_path = get_config_path()
-    current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    current_normalized = _drop_legacy_bedrock_provider_entries(
+        _normalize_root_model_keys(_normalize_max_turns_config(config))
+    )
     normalized = current_normalized
-    raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
+    raw_existing = _drop_legacy_bedrock_provider_entries(
+        _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
+    )
     if raw_existing:
         normalized = _preserve_env_ref_templates(
             normalized,

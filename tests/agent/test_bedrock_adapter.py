@@ -138,6 +138,69 @@ class TestResolveBedrocRegion:
             assert resolve_bedrock_region({}) == "us-east-1"
 
 
+class TestResolveBedrockAuthConfig:
+    def test_api_key_mode_requires_bearer_token(self):
+        from agent.bedrock_adapter import resolve_bedrock_auth_config
+
+        config = {"bedrock": {"auth_method": "api_key", "region": "us-east-1"}}
+
+        with pytest.raises(RuntimeError, match="AWS_BEARER_TOKEN_BEDROCK"):
+            resolve_bedrock_auth_config(config=config, env={})
+
+    def test_api_key_mode_keeps_bearer_token_for_client_builders(self):
+        from agent.bedrock_adapter import resolve_bedrock_auth_config
+
+        config = {"bedrock": {"auth_method": "api_key", "region": "us-east-1"}}
+        env = {"AWS_BEARER_TOKEN_BEDROCK": "bearer-token"}
+
+        resolved = resolve_bedrock_auth_config(config=config, env=env)
+
+        assert resolved["method"] == "api_key"
+        assert resolved["source"] == "AWS_BEARER_TOKEN_BEDROCK"
+        assert resolved["api_key"] == "bearer-token"
+
+    def test_profile_mode_uses_configured_profile_over_ambient_bearer(self):
+        from agent.bedrock_adapter import resolve_bedrock_auth_config
+
+        config = {
+            "bedrock": {
+                "auth_method": "profile",
+                "profile": "engineering",
+                "region": "us-east-1",
+            }
+        }
+        env = {
+            "AWS_BEARER_TOKEN_BEDROCK": "absk-test",
+            "AWS_PROFILE": "wrong-profile",
+        }
+
+        resolved = resolve_bedrock_auth_config(config=config, env=env)
+
+        assert resolved["method"] == "profile"
+        assert resolved["profile"] == "engineering"
+        assert resolved["source"] == "AWS_PROFILE:engineering"
+
+    def test_default_chain_ignores_ambient_bedrock_api_key(self):
+        from agent.bedrock_adapter import resolve_bedrock_auth_config
+
+        config = {"bedrock": {"auth_method": "default_chain", "region": "us-east-1"}}
+        env = {"AWS_BEARER_TOKEN_BEDROCK": "stale-bearer-token"}
+
+        resolved = resolve_bedrock_auth_config(config=config, env=env)
+
+        assert resolved["method"] == "default_chain"
+        assert resolved["source"] == "aws-sdk-default-chain"
+
+    def test_credentials_mode_requires_access_key_pair(self):
+        from agent.bedrock_adapter import resolve_bedrock_auth_config
+
+        config = {"bedrock": {"auth_method": "credentials", "region": "us-east-1"}}
+        env = {"AWS_ACCESS_KEY_ID": "AKIAONLY"}
+
+        with pytest.raises(RuntimeError, match="AWS_ACCESS_KEY_ID"):
+            resolve_bedrock_auth_config(config=config, env=env)
+
+
 # ---------------------------------------------------------------------------
 # Tool conversion
 # ---------------------------------------------------------------------------
@@ -878,6 +941,22 @@ class TestClientCache:
         assert len(_bedrock_runtime_client_cache) == 0
         assert len(_bedrock_control_client_cache) == 0
 
+    def test_cache_key_includes_auth_context(self):
+        from agent.bedrock_adapter import _bedrock_client_cache_key
+
+        api_key = _bedrock_client_cache_key(
+            "bedrock-runtime",
+            "us-east-1",
+            {"method": "api_key", "cache_identity": "api_key:abcd1234"},
+        )
+        profile = _bedrock_client_cache_key(
+            "bedrock-runtime",
+            "us-east-1",
+            {"method": "profile", "cache_identity": "profile:engineering"},
+        )
+
+        assert api_key != profile
+
 
 # ---------------------------------------------------------------------------
 # Streaming with callbacks
@@ -1087,6 +1166,14 @@ class TestBedrockErrorClassification:
 class TestBedrockContextLength:
     """Test Bedrock model context length lookup."""
 
+    def test_claude_opus_4_7_uses_full_bedrock_window(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-opus-4-7") == 1_000_000
+
+    def test_claude_opus_4_7_global_profile_uses_full_bedrock_window(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("global.anthropic.claude-opus-4-7") == 1_000_000
+
     def test_claude_opus_4_6(self):
         from agent.bedrock_adapter import get_bedrock_context_length
         assert get_bedrock_context_length("anthropic.claude-opus-4-6-20250514-v1:0") == 200_000
@@ -1224,6 +1311,18 @@ class TestIsAnthropicBedrockModel:
     def test_eu_claude(self):
         from agent.bedrock_adapter import is_anthropic_bedrock_model
         assert is_anthropic_bedrock_model("eu.anthropic.claude-sonnet-4-6") is True
+
+    def test_jp_claude(self):
+        from agent.bedrock_adapter import is_anthropic_bedrock_model
+        assert is_anthropic_bedrock_model("jp.anthropic.claude-sonnet-4-6") is True
+
+    def test_apac_claude(self):
+        from agent.bedrock_adapter import is_anthropic_bedrock_model
+        assert is_anthropic_bedrock_model("apac.anthropic.claude-haiku-4-5") is True
+
+    def test_au_claude(self):
+        from agent.bedrock_adapter import is_anthropic_bedrock_model
+        assert is_anthropic_bedrock_model("au.anthropic.claude-sonnet-4-6") is True
 
 
 class TestEmptyTextBlockFix:
