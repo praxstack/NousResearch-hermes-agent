@@ -456,7 +456,10 @@ class TestCodexOAuthContextLength:
 # =========================================================================
 
 class TestGetModelContextLength:
-    def test_bedrock_opus_4_7_uses_bedrock_context_table(self, tmp_path):
+    def test_bedrock_opus_4_7_default_context_is_200k(self, tmp_path):
+        """Opus 4.7 on Bedrock: static table returns 200K (not 1M) by default.
+        The 1M window requires selecting the :1m suffix variant explicitly.
+        """
         cache_file = tmp_path / "cache.yaml"
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
             save_context_length(
@@ -469,7 +472,18 @@ class TestGetModelContextLength:
                 base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
                 provider="bedrock",
             )
-        assert result == 1000000
+        assert result == 200_000
+
+    def test_bedrock_opus_4_7_1m_variant_context_is_1m(self, tmp_path):
+        """Opus 4.7:1m variant returns 1M context via the static table."""
+        cache_file = tmp_path / "cache.yaml"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            result = get_model_context_length(
+                "anthropic.claude-opus-4-7:1m",
+                base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+                provider="bedrock",
+            )
+        assert result == 1_000_000
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_known_model_from_api(self, mock_fetch):
