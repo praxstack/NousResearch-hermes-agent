@@ -4347,7 +4347,16 @@ def _discover_bedrock_model_list(region, current_model="", config_preview=None):
         return None
 
 
-def _save_bedrock_model_selection(selected, region, auth_method, profile=""):
+def _save_bedrock_model_selection(
+    selected,
+    region,
+    auth_method,
+    profile="",
+    *,
+    use_cross_region_inference: bool = True,
+    use_global_inference_profile: bool = True,
+    use_prompt_caching: bool = True,
+):
     from hermes_cli.auth import deactivate_provider
     from hermes_cli.config import get_env_value, load_config, save_config, save_env_value
 
@@ -4369,6 +4378,18 @@ def _save_bedrock_model_selection(selected, region, auth_method, profile=""):
         bedrock_cfg["profile"] = profile
     else:
         bedrock_cfg.pop("profile", None)
+
+    # Cline-parity: persist inference profile and caching preferences.
+    # use_cross_region_inference — prefix model IDs with us./eu./apac./au./jp.
+    #   based on configured region; improves resilience and throughput.
+    # use_global_inference_profile — prefer global.* prefix for models that
+    #   support it (Claude Opus 4.6+); routes to the nearest AWS region.
+    # use_prompt_caching — inject cachePoint/cache_control markers on the two
+    #   most recent user messages and on the system prompt.
+    bedrock_cfg["use_cross_region_inference"] = bool(use_cross_region_inference)
+    bedrock_cfg["use_global_inference_profile"] = bool(use_global_inference_profile)
+    bedrock_cfg["use_prompt_caching"] = bool(use_prompt_caching)
+
     cfg["bedrock"] = bedrock_cfg
 
     if get_env_value("OPENAI_BASE_URL"):
@@ -4434,6 +4455,28 @@ def _model_flow_bedrock_api_key(
     bedrock_preview["auth_method"] = "api_key"
     preview_cfg["bedrock"] = bedrock_preview
 
+    # Read existing inference/caching preferences — preserve on re-run.
+    _default_cri = bedrock_preview.get("use_cross_region_inference", True)
+    _default_global = bedrock_preview.get("use_global_inference_profile", True)
+    _default_cache = bedrock_preview.get("use_prompt_caching", True)
+
+    def _yn(prompt_text, dv):
+        ds = "Y/n" if dv else "y/N"
+        try:
+            r = input(f"  {prompt_text} [{ds}]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            raise
+        return dv if not r else r in ("y", "yes")
+
+    try:
+        use_cri = _yn("Use cross-region inference?", _default_cri)
+        use_global = _yn("Use global inference profile when available?", _default_global) if use_cri else False
+        use_cache = _yn("Enable prompt caching?", _default_cache)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+    print()
+
     selected = _discover_bedrock_model_list(
         region,
         current_model=current_model,
@@ -4444,7 +4487,12 @@ def _model_flow_bedrock_api_key(
         return
 
     _save_model_choice(selected)
-    _save_bedrock_model_selection(selected, region, "api_key")
+    _save_bedrock_model_selection(
+        selected, region, "api_key",
+        use_cross_region_inference=use_cri,
+        use_global_inference_profile=use_global,
+        use_prompt_caching=use_cache,
+    )
     print(f"  Default model set to: {selected} (via AWS Bedrock API Key, {region})")
 
 
@@ -4568,7 +4616,53 @@ def _model_flow_bedrock(config, current_model=""):
     preview_cfg["bedrock"] = bedrock_preview
 
     print()
-    print(f"  Discovering models in {region}...")
+    # ── Cline-parity: inference profile + prompt caching toggles ─────────
+    # Read existing config values as defaults so re-running `hermes model`
+    # preserves previous choices rather than resetting them.
+    _existing_bedrock_cfg = load_config().get("bedrock", {})
+    _default_cri = _existing_bedrock_cfg.get("use_cross_region_inference", True)
+    _default_global = _existing_bedrock_cfg.get("use_global_inference_profile", True)
+    _default_cache = _existing_bedrock_cfg.get("use_prompt_caching", True)
+
+    def _yes_no(prompt_text, default_value):
+        """Prompt for a y/n choice with a default."""
+        default_str = "Y/n" if default_value else "y/N"
+        try:
+            raw = input(f"  {prompt_text} [{default_str}]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            raise
+        if not raw:
+            return default_value
+        return raw in ("y", "yes")
+
+    try:
+        print(
+            "  Cross-region inference routes requests to AWS infrastructure across\n"
+            "  multiple regions for higher throughput and resilience. Recommended.\n"
+        )
+        use_cross_region_inference = _yes_no("Use cross-region inference?", _default_cri)
+
+        if use_cross_region_inference:
+            print(
+                "  Global inference profiles (global.*) route to the geographically\n"
+                "  nearest region automatically. Only supported on Opus 4.6+.\n"
+            )
+            use_global_inference_profile = _yes_no("Use global inference profile when available?", _default_global)
+        else:
+            use_global_inference_profile = False
+
+        print(
+            "  Prompt caching marks the system prompt and recent conversation turns\n"
+            "  for Bedrock to cache on their infrastructure, reducing input token costs\n"
+            "  by up to 90%% on repeated context. Recommended for long conversations.\n"
+        )
+        use_prompt_caching = _yes_no("Enable prompt caching?", _default_cache)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+    print()
+
+    print(f"  Discovering models in {region}...  (cross-region: {use_cross_region_inference}, global: {use_global_inference_profile}, caching: {use_prompt_caching})")
     selected = _discover_bedrock_model_list(
         region,
         current_model=current_model,
@@ -4586,7 +4680,12 @@ def _model_flow_bedrock(config, current_model=""):
         save_env_value("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
 
     _save_model_choice(selected)
-    _save_bedrock_model_selection(selected, region, auth_method, profile=profile)
+    _save_bedrock_model_selection(
+        selected, region, auth_method, profile=profile,
+        use_cross_region_inference=use_cross_region_inference,
+        use_global_inference_profile=use_global_inference_profile,
+        use_prompt_caching=use_prompt_caching,
+    )
     print(f"  Default model set to: {selected} (via AWS Bedrock, {region})")
 
 
