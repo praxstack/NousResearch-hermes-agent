@@ -9601,6 +9601,14 @@ class HermesCLI:
             """Ctrl+Enter (c-j) inserts a newline. Most terminals send c-j for Ctrl+Enter."""
             event.current_buffer.insert_text('\n')
 
+        try:
+            @kb.add('s-enter')
+            def handle_shift_enter(event):
+                """Shift+Enter inserts a newline (Kitty keyboard protocol — Ghostty, Kitty, WezTerm)."""
+                event.current_buffer.insert_text('\n')
+        except (ValueError, KeyError):
+            pass  # prompt_toolkit version doesn't support 's-enter'
+
         # VSCode/Cursor bind Ctrl+G to "Find Next" at the editor level, so
         # the keystroke never reaches the embedded terminal. Alt+G is unbound
         # in those IDEs and arrives here as ('escape', 'g') — register it as

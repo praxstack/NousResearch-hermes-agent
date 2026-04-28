@@ -2548,13 +2548,24 @@ class GatewayRunner:
                 return True
             if enabled_platform_count > 0:
                 reason = "; ".join(startup_retryable_errors) or "all configured messaging platforms failed to connect"
-                logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
-                try:
-                    from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                except Exception:
-                    pass
-                return False
+                # When all adapter failures are retryable, stay alive instead of exiting.
+                # Network outages (Mac sleep, DNS failures) are transient — the background
+                # reconnection loop will recover when network returns. _failed_platforms is
+                # guaranteed non-empty here (every retryable error queues into it).
+                if self._failed_platforms:
+                    logger.warning(
+                        "All messaging platforms failed to connect (%s), but staying alive "
+                        "for cron execution and background reconnection (%d platform(s) queued)",
+                        reason, len(self._failed_platforms),
+                    )
+                else:
+                    logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
+                    try:
+                        from gateway.status import write_runtime_status
+                        write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+                    except Exception:
+                        pass
+                    return False
             logger.warning("No messaging platforms enabled.")
             logger.info("Gateway will continue running for cron job execution.")
         
@@ -5267,9 +5278,13 @@ class GatewayRunner:
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
+            _hook_adapter = self.adapters.get(source.platform) if source.platform else None
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
+                "messages": agent_messages,
+                "adapter": _hook_adapter,
+                "chat_id": str(source.chat_id),
             })
             
             # Check for pending process watchers (check_interval on background processes)
