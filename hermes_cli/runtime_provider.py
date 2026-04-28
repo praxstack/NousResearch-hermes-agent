@@ -1204,8 +1204,8 @@ def resolve_runtime_provider(
     if provider == "bedrock":
         from agent.bedrock_adapter import (
             has_aws_credentials,
-            resolve_aws_auth_env_var,
             resolve_bedrock_region,
+            resolve_bedrock_auth_config,
             is_anthropic_bedrock_model,
         )
         # When the user explicitly selected bedrock (not auto-detected),
@@ -1222,11 +1222,17 @@ def resolve_runtime_provider(
                 "Or run 'aws configure' to set up credentials.",
                 code="no_aws_credentials",
             )
-        # Read bedrock-specific config from config.yaml
-        _bedrock_cfg = load_config().get("bedrock", {})
+        # Read bedrock-specific config from config.yaml.
+        _full_cfg = load_config()
+        _bedrock_cfg = _full_cfg.get("bedrock", {})
         # Region priority: config.yaml bedrock.region → env var → us-east-1
         region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
-        auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
+        try:
+            auth_config = resolve_bedrock_auth_config(config=_full_cfg, env=os.environ)
+            auth_source = auth_config.get("source", "aws-sdk-default-chain")
+            region = auth_config.get("region", region) or region
+        except RuntimeError as exc:
+            raise AuthError(str(exc), provider="bedrock", code="invalid_bedrock_auth") from exc
         # Build guardrail config if configured
         _gr = _bedrock_cfg.get("guardrail", {})
         guardrail_config = None
