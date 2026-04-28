@@ -259,6 +259,77 @@ class TestAnthropicOAuthFlag:
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
 
+class TestBedrockAuxiliaryClient:
+    """Bedrock auxiliary resolution should follow the native Bedrock provider."""
+
+    def test_resolves_bedrock_claude_through_anthropic_bedrock(self, caplog):
+        real_client = MagicMock()
+        auth_config = {
+            "method": "api_key",
+            "region": "us-east-1",
+            "api_key": "bedrock-test-key",
+            "cache_identity": "api_key:test",
+        }
+
+        with patch(
+            "agent.bedrock_adapter.resolve_bedrock_auth_config",
+            return_value=auth_config,
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_bedrock_client",
+            return_value=real_client,
+        ) as mock_build, caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            client, model = resolve_provider_client(
+                "bedrock",
+                "global.anthropic.claude-opus-4-7",
+            )
+
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        assert isinstance(client, AnthropicAuxiliaryClient)
+        assert model == "global.anthropic.claude-opus-4-7"
+        assert client.base_url == "https://bedrock-runtime.us-east-1.amazonaws.com"
+        mock_build.assert_called_once_with("us-east-1", auth_config)
+        assert not any("unhandled auth_type aws_sdk" in rec.message for rec in caplog.records)
+
+    def test_resolves_async_bedrock_claude_client(self):
+        real_client = MagicMock()
+        auth_config = {
+            "method": "api_key",
+            "region": "us-east-1",
+            "api_key": "bedrock-test-key",
+            "cache_identity": "api_key:test",
+        }
+
+        with patch(
+            "agent.bedrock_adapter.resolve_bedrock_auth_config",
+            return_value=auth_config,
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_bedrock_client",
+            return_value=real_client,
+        ):
+            client, model = resolve_provider_client(
+                "bedrock",
+                "anthropic.claude-sonnet-4-20250514-v1:0",
+                async_mode=True,
+            )
+
+        from agent.auxiliary_client import AsyncAnthropicAuxiliaryClient
+
+        assert isinstance(client, AsyncAnthropicAuxiliaryClient)
+        assert model == "anthropic.claude-sonnet-4-20250514-v1:0"
+
+    def test_bedrock_non_claude_returns_none_without_unhandled_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            client, model = resolve_provider_client(
+                "bedrock",
+                "amazon.nova-pro-v1:0",
+            )
+
+        assert client is None
+        assert model is None
+        assert not any("unhandled auth_type aws_sdk" in rec.message for rec in caplog.records)
+
+
 class TestTryCodex:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
         with (

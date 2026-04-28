@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import re
+from contextlib import contextmanager
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -62,23 +64,37 @@ def _get_bedrock_runtime_client(region: str):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
+
+    Cache lookup honours two key forms:
+      * Bare ``<region>`` — legacy tests and pre-refactor code paths.
+      * Composite ``bedrock-runtime|<region>|<auth-hash>`` — post Apr 2026.
+
+    If a bare-region entry exists we return it directly, so test fixtures
+    that pre-seed the cache via ``_bedrock_runtime_client_cache[region] = …``
+    continue to work.
     """
-    if region not in _bedrock_runtime_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
+    # Backward-compat: honour bare-region pre-seeded entries first.
+    if region in _bedrock_runtime_client_cache:
+        return _bedrock_runtime_client_cache[region]
+
+    auth_config = resolve_bedrock_auth_config()
+    cache_key = _bedrock_client_cache_key("bedrock-runtime", region, auth_config)
+    if cache_key not in _bedrock_runtime_client_cache:
+        _bedrock_runtime_client_cache[cache_key] = _create_bedrock_client(
+            "bedrock-runtime", region, auth_config
         )
-    return _bedrock_runtime_client_cache[region]
+    return _bedrock_runtime_client_cache[cache_key]
 
 
-def _get_bedrock_control_client(region: str):
+def _get_bedrock_control_client(region: str, config: Optional[Dict[str, Any]] = None):
     """Get or create a cached ``bedrock`` control-plane client for model discovery."""
-    if region not in _bedrock_control_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_control_client_cache[region] = boto3.client(
-            "bedrock", region_name=region,
+    auth_config = resolve_bedrock_auth_config(config=config)
+    cache_key = _bedrock_client_cache_key("bedrock", region, auth_config)
+    if cache_key not in _bedrock_control_client_cache:
+        _bedrock_control_client_cache[cache_key] = _create_bedrock_client(
+            "bedrock", region, auth_config
         )
-    return _bedrock_control_client_cache[region]
+    return _bedrock_control_client_cache[cache_key]
 
 
 def reset_client_cache():
@@ -95,12 +111,23 @@ def invalidate_runtime_client(region: str) -> bool:
     gone stale, so the next call allocates a fresh client (with a fresh
     connection pool) instead of reusing a dead socket.
 
-    Returns True if a cached entry was evicted, False if the region was not
-    cached.
+    Returns True if any cached entry was evicted, False if the region had no
+    cached clients. Handles both the legacy bare-region cache key and the
+    composite ``bedrock-runtime|<region>|<auth-hash>`` form used after the
+    Apr 2026 auth-config refactor — evicting every entry whose key matches
+    the given region.
     """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
-    return existed
+    evicted = False
+    # Legacy bare-region entries (tests + pre-refactor code paths).
+    if region in _bedrock_runtime_client_cache:
+        _bedrock_runtime_client_cache.pop(region, None)
+        evicted = True
+    # Composite entries: "bedrock-runtime|<region>|<auth-hash>".
+    for key in [k for k in _bedrock_runtime_client_cache
+                if isinstance(k, str) and f"|{region}|" in k]:
+        _bedrock_runtime_client_cache.pop(key, None)
+        evicted = True
+    return evicted
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +231,75 @@ def is_stale_connection_error(exc: BaseException) -> bool:
 #   2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (explicit IAM credentials)
 #   3. AWS_PROFILE (named profile → SSO, assume-role, etc.)
 #   4. Implicit: instance role, ECS task role, Lambda execution role
+BEDROCK_INFERENCE_PROFILE_PREFIXES = (
+    "global.",
+    "us.",
+    "eu.",
+    "jp.",
+    "apac.",
+    "au.",
+)
+
+# ---------------------------------------------------------------------------
+# 1M-context variant support (Cline parity — see their bedrock.ts).
+# ---------------------------------------------------------------------------
+# AWS Bedrock exposes Claude Opus 4.7 / Opus 4.6 / Sonnet 4.6 with a 200K
+# context window by default and a 1M window under the ``context-1m-2025-08-07``
+# Anthropic beta.  Following Cline's UX, we expose the 1M variant as a
+# separate model ID with a ``:1m`` suffix (e.g. ``anthropic.claude-opus-4-7:1m``).
+#
+# On the wire we:
+#   1. Strip the ``:1m`` suffix from the modelId before calling Bedrock.
+#   2. Add ``anthropic_beta: ["context-1m-2025-08-07"]`` to
+#      ``additionalModelRequestFields`` (Converse) or
+#      ``extra_headers={"anthropic-beta": "context-1m-2025-08-07"}``
+#      (AnthropicBedrock SDK).
+#
+# This lets callers opt into 1M context explicitly (the 1M tier is billed
+# ~2x on input over 200K) without accidentally paying the premium.
+CLAUDE_1M_SUFFIX = ":1m"
+CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
+# Base Claude model IDs that support the 1M context variant on Bedrock.
+# Includes the foundation-model IDs; regional/global inference-profile
+# prefixes are handled at runtime via the prefix check in
+# ``split_bedrock_1m_suffix``.
+_CLAUDE_1M_CAPABLE_BASE_IDS = (
+    "anthropic.claude-opus-4-7",
+    "anthropic.claude-opus-4-6-v1",
+    "anthropic.claude-opus-4-6",
+    "anthropic.claude-sonnet-4-6",
+)
+
+
+def split_bedrock_1m_suffix(model_id: str) -> tuple:
+    """Split ``model_id`` into ``(base_model_id, enable_1m_context)``.
+
+    Accepts both the raw suffix form (``anthropic.claude-opus-4-7:1m``) and
+    the regional-prefix form (``us.anthropic.claude-opus-4-7:1m``).  Returns
+    the base ID (minus ``:1m``) and a bool indicating whether the 1M beta
+    header should be attached to the request.
+    """
+    if not isinstance(model_id, str):
+        return model_id, False
+    if model_id.endswith(CLAUDE_1M_SUFFIX):
+        return model_id[: -len(CLAUDE_1M_SUFFIX)], True
+    return model_id, False
+
+
+def is_claude_1m_capable_model(model_id: str) -> bool:
+    """Return True if the model can be upgraded to a 1M context window."""
+    if not isinstance(model_id, str):
+        return False
+    base, _ = split_bedrock_1m_suffix(model_id)
+    lowered = base.lower()
+    # Strip optional regional / global inference-profile prefix.
+    for prefix in BEDROCK_INFERENCE_PROFILE_PREFIXES:
+        if lowered.startswith(prefix):
+            lowered = lowered[len(prefix):]
+            break
+    return any(lowered.startswith(base_id) for base_id in _CLAUDE_1M_CAPABLE_BASE_IDS)
+
 _AWS_CREDENTIAL_ENV_VARS = [
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_ACCESS_KEY_ID",
@@ -213,6 +309,44 @@ _AWS_CREDENTIAL_ENV_VARS = [
     "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
 ]
+
+_AWS_ENV_MASK_FOR_API_KEY = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+)
+
+_AWS_ENV_MASK_FOR_PROFILE = (
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+)
+
+_AWS_ENV_MASK_FOR_CREDENTIALS = (
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_PROFILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+)
+
+_AWS_ENV_MASK_FOR_DEFAULT_CHAIN = (
+    "AWS_BEARER_TOKEN_BEDROCK",
+)
 
 
 def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[str]:
@@ -301,6 +435,187 @@ def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     )
 
 
+def _normalize_bedrock_bearer_token(raw: str) -> str:
+    """Strip whitespace and optional ``Bearer `` prefix from an AWS bearer token.
+
+    Guards against common user error where the AWS console's "Copy" button
+    yields ``Bearer abc123`` or the token arrives with trailing whitespace /
+    newlines from ``export AWS_BEARER_TOKEN_BEDROCK="$(cat token.txt)"``.
+    """
+    token = str(raw or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].lstrip()
+    return token
+
+
+def resolve_bedrock_auth_config(
+    config: Optional[Dict[str, Any]] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Resolve the configured Bedrock auth mode into a normalized config dict."""
+    env = env if env is not None else os.environ
+    if config is None:
+        try:
+            from hermes_cli.config import load_config as _load_config
+
+            config = _load_config()
+        except Exception:
+            config = {}
+
+    bedrock_cfg = config.get("bedrock", {}) if isinstance(config, dict) else {}
+    if not isinstance(bedrock_cfg, dict):
+        bedrock_cfg = {}
+
+    method = str(bedrock_cfg.get("auth_method") or "default_chain").strip().lower()
+    if method not in {"api_key", "profile", "credentials", "default_chain"}:
+        method = "default_chain"
+
+    region = str(bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region(env)
+
+    # VPC endpoint URL — for enterprise Bedrock-in-VPC deployments. Takes the
+    # explicit bedrock.vpc_endpoint_url config key, else the ``AWS_ENDPOINT_URL``
+    # / ``AWS_ENDPOINT_URL_BEDROCK_RUNTIME`` env vars that botocore already
+    # recognises. Captured here so every client creation path uses it.
+    endpoint_url = (
+        str(bedrock_cfg.get("vpc_endpoint_url") or "").strip()
+        or str(env.get("AWS_ENDPOINT_URL_BEDROCK_RUNTIME") or "").strip()
+        or str(env.get("AWS_ENDPOINT_URL") or "").strip()
+    )
+    endpoint_cache_suffix = (
+        f":endpoint={sha256(endpoint_url.encode('utf-8')).hexdigest()[:8]}"
+        if endpoint_url
+        else ""
+    )
+
+    if method == "api_key":
+        token = _normalize_bedrock_bearer_token(
+            env.get("AWS_BEARER_TOKEN_BEDROCK") or ""
+        )
+        if not token:
+            raise RuntimeError(
+                "Bedrock auth_method=api_key requires AWS_BEARER_TOKEN_BEDROCK"
+            )
+        return {
+            "method": "api_key",
+            "region": region,
+            "api_key": token,
+            "source": "AWS_BEARER_TOKEN_BEDROCK",
+            "cache_identity": f"api_key:{sha256(token.encode('utf-8')).hexdigest()[:8]}{endpoint_cache_suffix}",
+            "endpoint_url": endpoint_url,
+        }
+
+    if method == "profile":
+        profile = str(bedrock_cfg.get("profile") or env.get("AWS_PROFILE") or "").strip()
+        if not profile:
+            raise RuntimeError(
+                "Bedrock auth_method=profile requires bedrock.profile or AWS_PROFILE"
+            )
+        return {
+            "method": "profile",
+            "region": region,
+            "profile": profile,
+            "source": f"AWS_PROFILE:{profile}",
+            "cache_identity": f"profile:{profile}{endpoint_cache_suffix}",
+            "endpoint_url": endpoint_url,
+        }
+
+    if method == "credentials":
+        access_key = str(env.get("AWS_ACCESS_KEY_ID") or "").strip()
+        secret_key = str(env.get("AWS_SECRET_ACCESS_KEY") or "").strip()
+        session_token = str(env.get("AWS_SESSION_TOKEN") or "").strip()
+        if not access_key or not secret_key:
+            raise RuntimeError(
+                "Bedrock auth_method=credentials requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+            )
+        return {
+            "method": "credentials",
+            "region": region,
+            "access_key_id": access_key,
+            "secret_access_key": secret_key,
+            "session_token": session_token,
+            "source": "AWS_ACCESS_KEY_ID",
+            "cache_identity": f"credentials:{access_key[:8]}{endpoint_cache_suffix}",
+            "endpoint_url": endpoint_url,
+        }
+
+    return {
+        "method": "default_chain",
+        "region": region,
+        "source": resolve_aws_auth_env_var(
+            {k: v for k, v in env.items() if k != "AWS_BEARER_TOKEN_BEDROCK"}
+        )
+        or "aws-sdk-default-chain",
+        "cache_identity": f"default_chain{endpoint_cache_suffix}",
+        "endpoint_url": endpoint_url,
+    }
+
+
+def _bedrock_client_cache_key(
+    service: str,
+    region: str,
+    auth_config: Dict[str, str],
+) -> str:
+    return ":".join(
+        (
+            service,
+            region,
+            auth_config.get("method", "default_chain"),
+            auth_config.get("cache_identity", "default_chain"),
+        )
+    )
+
+
+@contextmanager
+def _masked_aws_env(mask_keys: Tuple[str, ...]):
+    saved = {key: os.environ.get(key) for key in mask_keys}
+    for key in mask_keys:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _create_bedrock_client(service: str, region: str, auth_config: Dict[str, str]):
+    boto3 = _require_boto3()
+    method = auth_config.get("method", "default_chain")
+
+    # VPC endpoint support: when configured, all service clients route through
+    # the customer's VPC endpoint URL (used by enterprise Bedrock-in-VPC deployments).
+    endpoint_url = str(auth_config.get("endpoint_url") or "").strip()
+    extra_kwargs: Dict[str, Any] = {}
+    if endpoint_url:
+        extra_kwargs["endpoint_url"] = endpoint_url
+
+    if method == "api_key":
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY):
+            return boto3.client(service, region_name=region, **extra_kwargs)
+
+    if method == "profile":
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_PROFILE):
+            session = boto3.Session(profile_name=auth_config["profile"])
+            return session.client(service, region_name=region, **extra_kwargs)
+
+    if method == "credentials":
+        kwargs: Dict[str, Any] = {
+            "region_name": region,
+            "aws_access_key_id": auth_config["access_key_id"],
+            "aws_secret_access_key": auth_config["secret_access_key"],
+        }
+        if auth_config.get("session_token"):
+            kwargs["aws_session_token"] = auth_config["session_token"]
+        kwargs.update(extra_kwargs)
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_CREDENTIALS):
+            return boto3.client(service, **kwargs)
+
+    with _masked_aws_env(_AWS_ENV_MASK_FOR_DEFAULT_CHAIN):
+        return boto3.client(service, region_name=region, **extra_kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Tool-calling capability detection
 # ---------------------------------------------------------------------------
@@ -326,8 +641,29 @@ def _model_supports_tool_use(model_id: str) -> bool:
     Models in the denylist are known to reject toolConfig in the Converse API.
     Unknown models default to True (assume tool support).
     """
-    model_lower = model_id.lower()
+    # Strip the ``:1m`` context-window variant suffix so pattern matching
+    # remains anchored to the base model ID.
+    base, _ = split_bedrock_1m_suffix(model_id)
+    model_lower = base.lower()
     return not any(pattern in model_lower for pattern in _NON_TOOL_CALLING_PATTERNS)
+
+
+def is_application_inference_profile_arn(model_id: str) -> bool:
+    """Return True if ``model_id`` is an AWS Bedrock Application Inference Profile ARN.
+
+    Application Inference Profiles let customers route traffic through a
+    pre-created profile so usage is attributed to a cost allocation tag. The
+    ARN form is::
+
+        arn:aws:bedrock:<region>:<account>:application-inference-profile/<id>
+
+    Cline and the AWS SDK accept this ARN anywhere a modelId is expected. We
+    treat these profiles as Claude-capable (callers who paste them know what
+    they're invoking) — the runtime lets Bedrock validate the underlying
+    foundation model.
+    """
+    raw = (model_id or "").strip().lower()
+    return raw.startswith("arn:aws:bedrock:") and ":application-inference-profile/" in raw
 
 
 def is_anthropic_bedrock_model(model_id: str) -> bool:
@@ -339,13 +675,25 @@ def is_anthropic_bedrock_model(model_id: str) -> bool:
 
     Matches:
       - ``anthropic.claude-*`` (foundation model IDs)
-      - ``us.anthropic.claude-*`` (US inference profiles)
       - ``global.anthropic.claude-*`` (global inference profiles)
+      - ``us.anthropic.claude-*`` (US inference profiles)
       - ``eu.anthropic.claude-*`` (EU inference profiles)
+      - ``jp.anthropic.claude-*`` (Japan inference profiles)
+      - ``apac.anthropic.claude-*`` (APAC inference profiles)
+      - ``au.anthropic.claude-*`` (Australia inference profiles)
+      - Any of the above with a trailing ``:1m`` context-window variant
+      - Application Inference Profile ARNs (``arn:aws:bedrock:…:application-inference-profile/…``)
     """
-    model_lower = model_id.lower()
+    # Application Inference Profile ARNs route arbitrary Claude traffic through
+    # a customer-owned profile for cost allocation. We accept them as Claude.
+    if is_application_inference_profile_arn(model_id):
+        return True
+    # Strip optional ``:1m`` suffix first so the base match catches both
+    # ``anthropic.claude-opus-4-7`` and ``anthropic.claude-opus-4-7:1m``.
+    base, _ = split_bedrock_1m_suffix(model_id)
+    model_lower = base.lower()
     # Strip regional prefix if present
-    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
+    for prefix in BEDROCK_INFERENCE_PROFILE_PREFIXES:
         if model_lower.startswith(prefix):
             model_lower = model_lower[len(prefix):]
             break
@@ -823,11 +1171,20 @@ def build_converse_kwargs(
     """Build kwargs for ``bedrock-runtime.converse()`` or ``converse_stream()``.
 
     Converts OpenAI-format inputs to Converse API parameters.
+
+    If the model ID carries the ``:1m`` suffix, the suffix is stripped
+    from the wire ``modelId`` and the ``context-1m-2025-08-07`` Anthropic
+    beta is attached via ``additionalModelRequestFields`` — matching Cline's
+    Bedrock 1M-context-window opt-in.
     """
     system_prompt, converse_messages = convert_messages_to_converse(messages)
 
+    # 1M-context opt-in: strip ``:1m`` from the wire modelId and remember
+    # we need to attach the beta header.
+    wire_model, enable_1m_context = split_bedrock_1m_suffix(model)
+
     kwargs: Dict[str, Any] = {
-        "modelId": model,
+        "modelId": wire_model,
         "messages": converse_messages,
         "inferenceConfig": {
             "maxTokens": max_tokens,
@@ -854,13 +1211,23 @@ def build_converse_kwargs(
             # these models causes a ValidationException → retry loop → failure.
             # Strip tools for known non-tool-calling models and warn the user.
             # Ref: PR #7920 feedback from @ptlally, pattern from PR #4346.
-            if _model_supports_tool_use(model):
+            if _model_supports_tool_use(wire_model):
                 kwargs["toolConfig"] = {"tools": converse_tools}
             else:
                 logger.warning(
                     "Model %s does not support tool calling — tools stripped. "
-                    "The agent will operate in text-only mode.", model
+                    "The agent will operate in text-only mode.", wire_model
                 )
+
+    if enable_1m_context:
+        # Converse passes provider-specific request fields via
+        # ``additionalModelRequestFields``.  For Claude, the anthropic_beta
+        # list triggers the 1M context window.
+        kwargs.setdefault("additionalModelRequestFields", {})
+        betas = list(kwargs["additionalModelRequestFields"].get("anthropic_beta") or [])
+        if CONTEXT_1M_BETA not in betas:
+            betas.append(CONTEXT_1M_BETA)
+        kwargs["additionalModelRequestFields"]["anthropic_beta"] = betas
 
     if guardrail_config:
         kwargs["guardrailConfig"] = guardrail_config
@@ -967,6 +1334,7 @@ def reset_discovery_cache():
 def discover_bedrock_models(
     region: str,
     provider_filter: Optional[List[str]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Discover available Bedrock foundation models and inference profiles.
 
@@ -985,13 +1353,17 @@ def discover_bedrock_models(
     """
     import time
 
-    cache_key = f"{region}:{','.join(sorted(provider_filter or []))}"
+    auth_config = resolve_bedrock_auth_config(config=config)
+    cache_key = (
+        f"{region}:{auth_config.get('cache_identity', 'default_chain')}:"
+        f"{','.join(sorted(provider_filter or []))}"
+    )
     cached = _discovery_cache.get(cache_key)
     if cached and (time.time() - cached["timestamp"]) < _DISCOVERY_CACHE_TTL_SECONDS:
         return cached["models"]
 
     try:
-        client = _get_bedrock_control_client(region)
+        client = _get_bedrock_control_client(region, config=config)
     except Exception as e:
         logger.warning("Failed to create Bedrock client for model discovery: %s", e)
         return []
@@ -1180,7 +1552,11 @@ def classify_bedrock_error(error_message: str) -> str:
 # detection is unavailable.
 
 BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
-    # Anthropic Claude models on Bedrock
+    # Anthropic Claude models on Bedrock — default context window.
+    # Bedrock serves these at 200K by default; the 1M variant (see below)
+    # requires the ``context-1m-2025-08-07`` beta and is opted into via
+    # the ``:1m`` suffix on the model ID (matches Cline's UX).
+    "anthropic.claude-opus-4-7":     200_000,
     "anthropic.claude-opus-4-6":     200_000,
     "anthropic.claude-sonnet-4-6":   200_000,
     "anthropic.claude-sonnet-4-5":   200_000,
@@ -1192,6 +1568,16 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     "anthropic.claude-3-opus":       200_000,
     "anthropic.claude-3-sonnet":     200_000,
     "anthropic.claude-3-haiku":      200_000,
+    # 1M-context variants — opted into via the ``:1m`` suffix, which
+    # triggers the ``context-1m-2025-08-07`` Anthropic beta on Bedrock.
+    # Verified against Anthropic docs (Apr 28 2026):
+    # https://docs.anthropic.com/en/docs/build-with-claude/context-windows
+    # and Cline's bedrock.ts model catalog.
+    "anthropic.claude-opus-4-7:1m":       1_000_000,
+    "anthropic.claude-opus-4-6:1m":       1_000_000,
+    "anthropic.claude-opus-4-6-v1:1m":    1_000_000,
+    "anthropic.claude-sonnet-4-6:1m":     1_000_000,
+    "anthropic.claude-sonnet-4-5:1m":     1_000_000,
     # Amazon Nova
     "amazon.nova-pro":               300_000,
     "amazon.nova-lite":              300_000,

@@ -325,6 +325,7 @@ def run_doctor(args):
                 provider
                 and _resolve_provider_full is not None
                 and provider not in ("auto", "custom")
+                and provider not in known_providers
             ):
                 provider_def = _resolve_provider_full(provider, user_providers, custom_providers)
                 canonical_provider = provider_def.id if provider_def is not None else None

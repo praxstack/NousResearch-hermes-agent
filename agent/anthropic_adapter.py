@@ -382,7 +382,12 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
 
     normalize_proxy_env_vars()
 
-    from httpx import Timeout
+    try:
+        from httpx import Timeout
+
+        timeout = Timeout(timeout=900.0, connect=10.0)
+    except ImportError:
+        timeout = 900.0
 
     normalized_base_url = _normalize_base_url_text(base_url)
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
@@ -449,14 +454,18 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
-def build_anthropic_bedrock_client(region: str):
+def build_anthropic_bedrock_client(
+    region: str,
+    auth_config: Optional[Dict[str, str]] = None,
+):
     """Create an AnthropicBedrock client for Bedrock Claude models.
 
     Uses the Anthropic SDK's native Bedrock adapter, which provides full
     Claude feature parity: prompt caching, thinking budgets, adaptive
     thinking, fast mode — features not available via the Converse API.
 
-    Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
+    Auth follows the native Bedrock auth contract from ``agent.bedrock_adapter``:
+    Bedrock API key, AWS profile, explicit credentials, or default AWS chain.
     """
     if _anthropic_sdk is None:
         raise ImportError(
@@ -468,12 +477,55 @@ def build_anthropic_bedrock_client(region: str):
             "anthropic.AnthropicBedrock not available. "
             "Upgrade with: pip install 'anthropic>=0.39.0'"
         )
-    from httpx import Timeout
+    try:
+        from httpx import Timeout
 
-    return _anthropic_sdk.AnthropicBedrock(
-        aws_region=region,
-        timeout=Timeout(timeout=900.0, connect=10.0),
+        timeout = Timeout(timeout=900.0, connect=10.0)
+    except ImportError:
+        timeout = 900.0
+    from agent.bedrock_adapter import (
+        _AWS_ENV_MASK_FOR_CREDENTIALS,
+        _AWS_ENV_MASK_FOR_DEFAULT_CHAIN,
+        _AWS_ENV_MASK_FOR_PROFILE,
+        _masked_aws_env,
+        resolve_bedrock_auth_config,
     )
+
+    if auth_config is None:
+        auth_config = resolve_bedrock_auth_config()
+
+    kwargs: Dict[str, Any] = {
+        "aws_region": region,
+        "timeout": timeout,
+    }
+    # VPC endpoint support: when bedrock.vpc_endpoint_url (or AWS_ENDPOINT_URL*
+    # env) is set, route the Anthropic SDK through that endpoint. AnthropicBedrock
+    # accepts a ``base_url`` parameter for this purpose.
+    endpoint_url = str(auth_config.get("endpoint_url") or "").strip()
+    if endpoint_url:
+        kwargs["base_url"] = endpoint_url
+
+    method = auth_config.get("method", "default_chain")
+
+    if method == "api_key":
+        kwargs["api_key"] = auth_config["api_key"]
+        return _anthropic_sdk.AnthropicBedrock(**kwargs)
+
+    if method == "profile":
+        kwargs["aws_profile"] = auth_config["profile"]
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_PROFILE):
+            return _anthropic_sdk.AnthropicBedrock(**kwargs)
+
+    if method == "credentials":
+        kwargs["aws_access_key"] = auth_config["access_key_id"]
+        kwargs["aws_secret_key"] = auth_config["secret_access_key"]
+        if auth_config.get("session_token"):
+            kwargs["aws_session_token"] = auth_config["session_token"]
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_CREDENTIALS):
+            return _anthropic_sdk.AnthropicBedrock(**kwargs)
+
+    with _masked_aws_env(_AWS_ENV_MASK_FOR_DEFAULT_CHAIN):
+        return _anthropic_sdk.AnthropicBedrock(**kwargs)
 
 
 def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
@@ -1561,6 +1613,23 @@ def build_anthropic_kwargs(
     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
 
     model = normalize_model_name(model, preserve_dots=preserve_dots)
+
+    # 1M-context variant opt-in (Cline parity): the ``:1m`` suffix signals
+    # the user explicitly wants the 1M context window on Bedrock Claude.
+    # Strip the suffix before sending to the API and mark that we need to
+    # attach ``anthropic-beta: context-1m-2025-08-07`` to this request.
+    _enable_1m_context_beta = False
+    try:
+        from agent.bedrock_adapter import (
+            CLAUDE_1M_SUFFIX as _BEDROCK_1M_SUFFIX,
+            CONTEXT_1M_BETA as _BEDROCK_1M_BETA,
+        )
+    except ImportError:
+        _BEDROCK_1M_SUFFIX = ":1m"
+        _BEDROCK_1M_BETA = "context-1m-2025-08-07"
+    if isinstance(model, str) and model.endswith(_BEDROCK_1M_SUFFIX):
+        model = model[: -len(_BEDROCK_1M_SUFFIX)]
+        _enable_1m_context_beta = True
     # effective_max_tokens = output cap for this call (≠ total context window)
     # Use the resolver helper so non-positive values (negative ints,
     # fractional floats, NaN, non-numeric) fail locally with a clear error
@@ -1710,6 +1779,19 @@ def build_anthropic_kwargs(
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
+    # ── 1M context window beta (Bedrock Claude 4.6/4.7) ───────────────
+    # The ``:1m`` suffix was stripped above; we re-attach the Anthropic
+    # beta header here so the AnthropicBedrock SDK picks up the 1M context
+    # window.  Merges with any existing ``extra_headers`` set by fast mode.
+    if _enable_1m_context_beta:
+        existing = kwargs.get("extra_headers", {}) or {}
+        existing_beta = str(existing.get("anthropic-beta", "") or "")
+        existing_betas = [b.strip() for b in existing_beta.split(",") if b.strip()]
+        if _BEDROCK_1M_BETA not in existing_betas:
+            existing_betas.append(_BEDROCK_1M_BETA)
+        # Preserve the rest of extra_headers.
+        new_headers = dict(existing)
+        new_headers["anthropic-beta"] = ",".join(existing_betas)
+        kwargs["extra_headers"] = new_headers
+
     return kwargs
-
-

@@ -1962,6 +1962,67 @@ def resolve_provider_client(
         logger.warning("resolve_provider_client: unknown provider %r", provider)
         return None, None
 
+    if pconfig.auth_type == "aws_sdk":
+        if provider == "bedrock":
+            try:
+                from agent.anthropic_adapter import build_anthropic_bedrock_client
+                from agent.bedrock_adapter import (
+                    has_aws_credentials,
+                    is_anthropic_bedrock_model,
+                    resolve_bedrock_auth_config,
+                )
+
+                if not has_aws_credentials():
+                    logger.debug(
+                        "resolve_provider_client: bedrock requested but no AWS credentials found"
+                    )
+                    return None, None
+
+                # Default to Haiku 4.5 when no model supplied — keeps auxiliary
+                # tasks (compression, memory, summarization) usable for Bedrock users
+                # who haven't run `hermes model` yet.
+                _BEDROCK_AUX_DEFAULT = "anthropic.claude-haiku-4-5-20251001-v1:0"
+                requested_model = model or _read_main_model() or _BEDROCK_AUX_DEFAULT
+                final_model = _normalize_resolved_model(requested_model, provider)
+
+                if not final_model or not is_anthropic_bedrock_model(final_model):
+                    logger.debug(
+                        "resolve_provider_client: bedrock auxiliary only supports "
+                        "Anthropic Claude models, got %r",
+                        final_model,
+                    )
+                    return None, None
+
+                auth_config = resolve_bedrock_auth_config()
+                region = str(auth_config.get("region") or "us-east-1").strip()
+                real_client = build_anthropic_bedrock_client(region, auth_config)
+            except Exception as exc:
+                logger.warning(
+                    "resolve_provider_client: bedrock requested but native "
+                    "Bedrock client could not be created: %s",
+                    exc,
+                )
+                return None, None
+
+            base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+            sync_anthropic = AnthropicAuxiliaryClient(
+                real_client,
+                final_model,
+                "aws-sdk",
+                base_url,
+                is_oauth=False,
+            )
+            if async_mode:
+                return AsyncAnthropicAuxiliaryClient(sync_anthropic), final_model
+            return sync_anthropic, final_model
+
+        logger.debug(
+            "resolve_provider_client: AWS SDK provider %s is not supported as an "
+            "auxiliary client",
+            provider,
+        )
+        return None, None
+
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
             client, default_model = _try_anthropic()
@@ -2070,39 +2131,6 @@ def resolve_provider_client(
         logger.warning("resolve_provider_client: external-process provider %s not "
                        "directly supported", provider)
         return None, None
-
-    elif pconfig.auth_type == "aws_sdk":
-        # AWS SDK providers (Bedrock) — use the Anthropic Bedrock client via
-        # boto3's credential chain (IAM roles, SSO, env vars, instance metadata).
-        try:
-            from agent.bedrock_adapter import has_aws_credentials, resolve_bedrock_region
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-        except ImportError:
-            logger.warning("resolve_provider_client: bedrock requested but "
-                           "boto3 or anthropic SDK not installed")
-            return None, None
-
-        if not has_aws_credentials():
-            logger.debug("resolve_provider_client: bedrock requested but "
-                         "no AWS credentials found")
-            return None, None
-
-        region = resolve_bedrock_region()
-        default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
-        final_model = _normalize_resolved_model(model or default_model, provider)
-        try:
-            real_client = build_anthropic_bedrock_client(region)
-        except ImportError as exc:
-            logger.warning("resolve_provider_client: cannot create Bedrock "
-                           "client: %s", exc)
-            return None, None
-        client = AnthropicAuxiliaryClient(
-            real_client, final_model, api_key="aws-sdk",
-            base_url=f"https://bedrock-runtime.{region}.amazonaws.com",
-        )
-        logger.debug("resolve_provider_client: bedrock (%s, %s)", final_model, region)
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
-                else (client, final_model))
 
     elif pconfig.auth_type in ("oauth_device_code", "oauth_external"):
         # OAuth providers — route through their specific try functions
