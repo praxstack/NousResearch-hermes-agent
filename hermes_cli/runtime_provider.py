@@ -1219,7 +1219,60 @@ def resolve_runtime_provider(
         # feature parity (prompt caching, thinking budgets, adaptive thinking).
         # Non-Claude models use the Converse API for multi-model support.
         _current_model = str(model_cfg.get("default") or "").strip()
-        if is_anthropic_bedrock_model(_current_model):
+
+        # Apply cross-region / global inference profile prefix (Cline parity).
+        # Follows Cline's getModelId() logic exactly:
+        #   if use_global_inference_profile AND model supports global endpoint → global.<id>
+        #   elif use_cross_region_inference → us./eu./apac./au./jp. based on region
+        #   else → bare model id
+        _use_cri = bool(_bedrock_cfg.get("use_cross_region_inference", True))
+        _use_global = bool(_bedrock_cfg.get("use_global_inference_profile", True))
+        _use_prompt_caching = bool(_bedrock_cfg.get("use_prompt_caching", True))
+
+        try:
+            from agent.bedrock_adapter import (
+                BEDROCK_INFERENCE_PROFILE_PREFIXES,
+                CLAUDE_1M_SUFFIX,
+                _CLAUDE_1M_CAPABLE_BASE_IDS,
+                split_bedrock_1m_suffix,
+            )
+        except ImportError:
+            BEDROCK_INFERENCE_PROFILE_PREFIXES = ("global.", "us.", "eu.", "apac.", "au.", "jp.")
+            CLAUDE_1M_SUFFIX = ":1m"
+            split_bedrock_1m_suffix = lambda m: (m, False)  # noqa: E731
+            _CLAUDE_1M_CAPABLE_BASE_IDS = ()
+
+        def _apply_inference_prefix(model_id: str, region: str) -> str:
+            """Apply regional/global prefix following Cline's getModelId() logic."""
+            if not _use_cri:
+                return model_id
+            # Strip :1m suffix before prefixing — it goes after the prefix
+            base_id, has_1m = split_bedrock_1m_suffix(model_id)
+            suffix = CLAUDE_1M_SUFFIX if has_1m else ""
+            # Already prefixed — don't double-prefix
+            if base_id.startswith(BEDROCK_INFERENCE_PROFILE_PREFIXES):
+                return model_id
+            # Global inference profile — models that support it (Opus 4.6+)
+            _GLOBAL_CAPABLE = ("anthropic.claude-opus-4-6", "anthropic.claude-opus-4-7", "anthropic.claude-sonnet-4-6")
+            if _use_global and any(base_id.startswith(m) for m in _GLOBAL_CAPABLE):
+                return f"global.{base_id}{suffix}"
+            # Regional prefix based on configured region
+            region_lower = region.lower()
+            if region_lower.startswith("us-"):
+                return f"us.{base_id}{suffix}"
+            elif region_lower.startswith("eu-"):
+                return f"eu.{base_id}{suffix}"
+            elif region_lower.startswith("ap-northeast-1") or region_lower.startswith("ap-northeast-2") or region_lower.startswith("ap-northeast-3"):
+                return f"jp.{base_id}{suffix}"
+            elif region_lower.startswith("ap-"):
+                return f"apac.{base_id}{suffix}"
+            elif region_lower.startswith("au-") or region_lower.startswith("ap-southeast-2"):
+                return f"au.{base_id}{suffix}"
+            return model_id  # Region not supported for CRI — fallback to bare
+
+        effective_model = _apply_inference_prefix(_current_model, region)
+
+        if is_anthropic_bedrock_model(effective_model):
             # Claude on Bedrock → AnthropicBedrock SDK → anthropic_messages path
             runtime = {
                 "provider": "bedrock",
@@ -1229,6 +1282,8 @@ def resolve_runtime_provider(
                 "source": auth_source,
                 "region": region,
                 "bedrock_anthropic": True,  # Signal to use AnthropicBedrock client
+                "bedrock_model": effective_model,  # Pre-computed with CRI prefix
+                "bedrock_use_prompt_caching": _use_prompt_caching,
                 "requested_provider": requested_provider,
             }
         else:
@@ -1240,6 +1295,8 @@ def resolve_runtime_provider(
                 "api_key": "aws-sdk",
                 "source": auth_source,
                 "region": region,
+                "bedrock_model": effective_model,
+                "bedrock_use_prompt_caching": _use_prompt_caching,
                 "requested_provider": requested_provider,
             }
         if guardrail_config:

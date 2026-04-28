@@ -1067,20 +1067,87 @@ def run_doctor(args):
                 print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_e})', Colors.DIM)}           ")
 
     # -- AWS Bedrock --
-    # Bedrock uses the AWS SDK credential chain, not API keys.
+    # Show current auth mode, region, model, CRI/global/caching, and connectivity.
     try:
-        from agent.bedrock_adapter import has_aws_credentials, resolve_aws_auth_env_var, resolve_bedrock_region
-        if has_aws_credentials():
-            _auth_var = resolve_aws_auth_env_var()
-            _region = resolve_bedrock_region()
-            _label = "AWS Bedrock".ljust(20)
-            print(f"  Checking AWS Bedrock...", end="", flush=True)
+        from agent.bedrock_adapter import (
+            has_aws_credentials,
+            resolve_aws_auth_env_var,
+            resolve_bedrock_auth_config,
+            resolve_bedrock_region,
+        )
+        try:
+            from hermes_cli.config import load_config as _load_cfg_for_bedrock
+            _bedrock_full_cfg = _load_cfg_for_bedrock()
+        except Exception:
+            _bedrock_full_cfg = cfg if isinstance(locals().get("cfg"), dict) else {}
+        _bedrock_section = _bedrock_full_cfg.get("bedrock", {}) if isinstance(_bedrock_full_cfg, dict) else {}
+        _model_section_raw = _bedrock_full_cfg.get("model", {}) if isinstance(_bedrock_full_cfg, dict) else {}
+        _model_section = _model_section_raw if isinstance(_model_section_raw, dict) else {}
+
+        # Is Bedrock the active provider?
+        _active_provider = str(_model_section.get("provider") or "").strip().lower()
+        _configured_model = str(_model_section.get("default") or "").strip()
+        _is_bedrock_active = _active_provider == "bedrock"
+
+        if has_aws_credentials() or _is_bedrock_active:
+            print()
+            print(color("◆ Bedrock Configuration", Colors.CYAN, Colors.BOLD))
+
+            # Auth method
+            try:
+                _auth_config = resolve_bedrock_auth_config(config=_bedrock_full_cfg)
+                _auth_method = _auth_config.get("method", "default_chain")
+                _region = _auth_config.get("region") or resolve_bedrock_region()
+                _auth_source = _auth_config.get("source", "aws-sdk-default-chain")
+                _endpoint_url = _auth_config.get("endpoint_url", "")
+            except RuntimeError as _auth_err:
+                _auth_method = "?"
+                _region = str(_bedrock_section.get("region") or resolve_bedrock_region())
+                _auth_source = f"error: {_auth_err}"
+                _endpoint_url = ""
+
+            _auth_display = {
+                "api_key": "Bedrock API Key (AWS_BEARER_TOKEN_BEDROCK)",
+                "profile": f"AWS Profile ({_bedrock_section.get('profile') or 'default'})",
+                "credentials": "AWS Access Key + Secret",
+                "default_chain": "AWS default credential chain (env / SSO / IMDS)",
+            }.get(_auth_method, _auth_method)
+
+            check_ok("Auth method", f"({_auth_display})")
+            check_ok("Region", f"({_region})")
+            if _endpoint_url:
+                check_ok("VPC endpoint", f"({_endpoint_url})")
+
+            # Active model
+            if _configured_model:
+                _is_1m = _configured_model.endswith(":1m")
+                _model_note = " [1M context window]" if _is_1m else " [200K context window]"
+                check_ok("Active model", f"({_configured_model}{_model_note})")
+            else:
+                check_warn("No Bedrock model configured", "(run: hermes model → Amazon Bedrock)")
+
+            # Inference profile flags
+            _cri = _bedrock_section.get("use_cross_region_inference", None)
+            _global = _bedrock_section.get("use_global_inference_profile", None)
+            _cache = _bedrock_section.get("use_prompt_caching", None)
+            if _cri is None:
+                check_warn("Cross-region inference", "(not set — run: hermes model to configure)")
+            else:
+                icon_cri = "✓" if _cri else "○"
+                check_ok(f"Cross-region inference", f"({'enabled' if _cri else 'disabled'})")
+                if _cri:
+                    check_ok("Global inference profile", f"({'enabled' if _global else 'disabled'})")
+            check_ok("Prompt caching", f"({'enabled' if _cache else ('disabled' if _cache is False else 'not set')})")
+
+            # Live connectivity check
+            _label = "API connectivity".ljust(20)
+            print(f"  Checking Bedrock API...", end="", flush=True)
             try:
                 import boto3
                 _br_client = boto3.client("bedrock", region_name=_region)
                 _br_resp = _br_client.list_foundation_models()
                 _model_count = len(_br_resp.get("modelSummaries", []))
-                print(f"\r  {color('✓', Colors.GREEN)} {_label} {color(f'({_auth_var}, {_region}, {_model_count} models)', Colors.DIM)}           ")
+                print(f"\r  {color('✓', Colors.GREEN)} {_label} {color(f'(us-east-1, {_model_count} models)', Colors.DIM)}           ")
             except ImportError:
                 print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'(boto3 not installed — {sys.executable} -m pip install boto3)', Colors.DIM)}           ")
                 issues.append(f"Install boto3 for Bedrock: {sys.executable} -m pip install boto3")
@@ -1088,6 +1155,8 @@ def run_doctor(args):
                 _err_name = type(_e).__name__
                 print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_err_name}: {_e})', Colors.DIM)}           ")
                 issues.append(f"AWS Bedrock: {_err_name} — check IAM permissions for bedrock:ListFoundationModels")
+        elif _active_provider and _active_provider != "bedrock":
+            pass  # Non-Bedrock provider active — skip Bedrock section entirely
     except ImportError:
         pass  # bedrock_adapter not available — skip silently
 
