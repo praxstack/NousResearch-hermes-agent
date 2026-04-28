@@ -456,6 +456,21 @@ class TestCodexOAuthContextLength:
 # =========================================================================
 
 class TestGetModelContextLength:
+    def test_bedrock_opus_4_7_uses_bedrock_context_table(self, tmp_path):
+        cache_file = tmp_path / "cache.yaml"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            save_context_length(
+                "global.anthropic.claude-opus-4-7",
+                "https://bedrock-runtime.us-east-1.amazonaws.com",
+                128000,
+            )
+            result = get_model_context_length(
+                "global.anthropic.claude-opus-4-7",
+                base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+                provider="bedrock",
+            )
+        assert result == 1000000
+
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_known_model_from_api(self, mock_fetch):
         mock_fetch.return_value = {
