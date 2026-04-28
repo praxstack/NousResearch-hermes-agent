@@ -1,16 +1,21 @@
 ---
 sidebar_position: 14
 title: "AWS Bedrock"
-description: "Use Hermes Agent with Amazon Bedrock — native Converse API, IAM authentication, Guardrails, and cross-region inference"
+description: "Use Hermes Agent with Amazon Bedrock — native Converse API, Bedrock API keys, IAM authentication, Guardrails, and cross-region inference"
 ---
 
 # AWS Bedrock
 
-Hermes Agent supports Amazon Bedrock as a native provider using the **Converse API** — not the OpenAI-compatible endpoint. This gives you full access to the Bedrock ecosystem: IAM authentication, Guardrails, cross-region inference profiles, and all foundation models.
+Hermes Agent supports Amazon Bedrock as a native provider using the **Converse API** — not an OpenAI-compatible proxy endpoint. This gives you full access to the Bedrock ecosystem: Bedrock API keys, IAM authentication, Guardrails, cross-region inference profiles, and all foundation models.
 
 ## Prerequisites
 
-- **AWS credentials** — any source supported by the [boto3 credential chain](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html):
+- **Bedrock auth** — choose one method in `hermes model`:
+  - Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`)
+  - AWS profile
+  - explicit AWS access key credentials
+  - default AWS SDK credential chain
+- **AWS credentials** — for profile, explicit credentials, or default-chain auth, use any source supported by the [boto3 credential chain](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html):
   - IAM instance role (EC2, ECS, Lambda — zero config)
   - `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` environment variables
   - `AWS_PROFILE` for SSO or named profiles
@@ -33,7 +38,7 @@ pip install hermes-agent[bedrock]
 # Select Bedrock as your provider
 hermes model
 # → Choose "More providers..." → "AWS Bedrock"
-# → Select your region and model
+# → Select auth method, region, and model
 
 # Start chatting
 hermes chat
@@ -51,7 +56,23 @@ model:
 
 bedrock:
   region: us-east-2
+  auth_method: api_key
 ```
+
+Hermes stores a Bedrock API key only as `AWS_BEARER_TOKEN_BEDROCK`. It does not write Bedrock API keys into `OPENAI_API_KEY`, does not set `OPENAI_BASE_URL`, and does not route Bedrock through local proxy/custom provider state.
+
+### Auth Method
+
+Set `bedrock.auth_method` to one of:
+
+| Method | Source of truth | Use when |
+|--------|-----------------|----------|
+| `api_key` | `AWS_BEARER_TOKEN_BEDROCK` | You have a Bedrock API key and want direct local requests |
+| `profile` | `bedrock.profile` | You use AWS SSO or named profiles |
+| `credentials` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` | You want explicit credentials for Hermes |
+| `default_chain` | AWS SDK default credential chain | You run on AWS compute or manage auth outside Hermes |
+
+In `api_key`, `profile`, and `credentials` modes, Hermes uses the selected auth method as authoritative for Bedrock instead of silently falling through to unrelated ambient AWS credentials.
 
 ### Region
 
@@ -127,6 +148,9 @@ The doctor checks:
 - Whether `boto3` is installed
 - Whether the Bedrock API is reachable (ListFoundationModels)
 - Number of available models in your region
+- Legacy Hermes Bedrock API-key configs that routed through `bedrock-mantle` or the old local `bedrock-native` proxy
+
+Run `hermes doctor --fix` to repair legacy Bedrock API-key configs into native `provider: bedrock` configuration.
 
 ## Gateway (Messaging Platforms)
 
@@ -143,15 +167,12 @@ The gateway reads `config.yaml` and uses the same Bedrock provider configuration
 
 ### "No API key found" / "No AWS credentials"
 
-Hermes checks for credentials in this order:
-1. `AWS_BEARER_TOKEN_BEDROCK`
-2. `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`
-3. `AWS_PROFILE`
-4. EC2 instance metadata (IMDS)
-5. ECS container credentials
-6. Lambda execution role
+Check the selected `bedrock.auth_method`.
 
-If none are found, run `aws configure` or attach an IAM role to your compute instance.
+- `api_key`: set `AWS_BEARER_TOKEN_BEDROCK`.
+- `profile`: set `bedrock.profile` or choose a profile in `hermes model`.
+- `credentials`: set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+- `default_chain`: run `aws configure` or attach an IAM role to your compute instance.
 
 ### "Invocation of model ID ... with on-demand throughput isn't supported"
 

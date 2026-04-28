@@ -4103,166 +4103,31 @@ def _model_flow_stepfun(config, current_model=""):
         print("No change.")
 
 
-def _model_flow_bedrock_api_key(config, region, current_model=""):
-    """Bedrock API Key mode — uses the OpenAI-compatible bedrock-mantle endpoint.
-
-    For developers who don't have an AWS account but received a Bedrock API Key
-    from their AWS admin. Works like any OpenAI-compatible endpoint.
-    """
-    from hermes_cli.auth import (
-        _prompt_model_selection,
-        _save_model_choice,
-        deactivate_provider,
-    )
-    from hermes_cli.config import (
-        load_config,
-        save_config,
-        get_env_value,
-        save_env_value,
-    )
+def _discover_bedrock_model_list(region, current_model="", config_preview=None):
+    from hermes_cli.auth import _prompt_model_selection
     from hermes_cli.models import _PROVIDER_MODELS
 
-    mantle_base_url = f"https://bedrock-mantle.{region}.api.aws/v1"
-
-    # Prompt for API key
-    existing_key = get_env_value("AWS_BEARER_TOKEN_BEDROCK") or ""
-    if existing_key:
-        print(f"  Bedrock API Key: {existing_key[:12]}... ✓")
-    else:
-        print(f"  Endpoint: {mantle_base_url}")
-        print()
-        try:
-            import getpass
-
-            api_key = getpass.getpass("  Bedrock API Key: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if not api_key:
-            print("  Cancelled.")
-            return
-        save_env_value("AWS_BEARER_TOKEN_BEDROCK", api_key)
-        existing_key = api_key
-        print("  ✓ API key saved.")
-    print()
-
-    # Model selection — use static list (mantle doesn't need boto3 for discovery)
-    model_list = _PROVIDER_MODELS.get("bedrock", [])
-    print(f"  Showing {len(model_list)} curated models")
-
-    if model_list:
-        selected = _prompt_model_selection(model_list, current_model=current_model)
-    else:
-        try:
-            selected = input("  Model ID: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            selected = None
-
-    if selected:
-        _save_model_choice(selected)
-
-        # Save as custom provider pointing to bedrock-mantle
-        cfg = load_config()
-        model = cfg.get("model")
-        if not isinstance(model, dict):
-            model = {"default": model} if model else {}
-            cfg["model"] = model
-        model["provider"] = "custom"
-        model["base_url"] = mantle_base_url
-        model.pop("api_mode", None)  # chat_completions is the default
-
-        # Also save region in bedrock config for reference
-        bedrock_cfg = cfg.get("bedrock", {})
-        if not isinstance(bedrock_cfg, dict):
-            bedrock_cfg = {}
-        bedrock_cfg["region"] = region
-        cfg["bedrock"] = bedrock_cfg
-
-        # Save the API key env var name so hermes knows where to find it
-        save_env_value("OPENAI_API_KEY", existing_key)
-        save_env_value("OPENAI_BASE_URL", mantle_base_url)
-
-        save_config(cfg)
-        deactivate_provider()
-
-        print(f"  Default model set to: {selected} (via Bedrock API Key, {region})")
-        print(f"  Endpoint: {mantle_base_url}")
-    else:
-        print("  No change.")
-
-
-def _model_flow_bedrock(config, current_model=""):
-    """AWS Bedrock provider: verify credentials, pick region, discover models.
-
-    Uses the native Converse API via boto3 — not the OpenAI-compatible endpoint.
-    Auth is handled by the AWS SDK default credential chain (env vars, profile,
-    instance role), so no API key prompt is needed.
-    """
-    from hermes_cli.auth import (
-        _prompt_model_selection,
-        _save_model_choice,
-        deactivate_provider,
-    )
-    from hermes_cli.config import load_config, save_config
-    from hermes_cli.models import _PROVIDER_MODELS
-
-    # 1. Check for AWS credentials
     try:
         from agent.bedrock_adapter import (
-            has_aws_credentials,
-            resolve_aws_auth_env_var,
-            resolve_bedrock_region,
+            BEDROCK_INFERENCE_PROFILE_PREFIXES,
             discover_bedrock_models,
         )
     except ImportError:
-        print("  ✗ boto3 is not installed. Install it with:")
-        print("    pip install boto3")
-        print()
-        return
+        BEDROCK_INFERENCE_PROFILE_PREFIXES = (
+            "global.",
+            "us.",
+            "eu.",
+            "jp.",
+            "apac.",
+            "au.",
+        )
+        discover_bedrock_models = None
 
-    if not has_aws_credentials():
-        print("  ⚠ No AWS credentials detected via environment variables.")
-        print("  Bedrock will use boto3's default credential chain (IMDS, SSO, etc.)")
-        print()
-
-    auth_var = resolve_aws_auth_env_var()
-    if auth_var:
-        print(f"  AWS credentials: {auth_var} ✓")
-    else:
-        print("  AWS credentials: boto3 default chain (instance role / SSO)")
-    print()
-
-    # 2. Region selection
-    current_region = resolve_bedrock_region()
-    try:
-        region_input = input(f"  AWS Region [{current_region}]: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return
-    region = region_input or current_region
-
-    # 2b. Authentication mode
-    print("  Choose authentication method:")
-    print()
-    print("    1. IAM credential chain (recommended)")
-    print("       Works with EC2 instance roles, SSO, env vars, aws configure")
-    print("    2. Bedrock API Key")
-    print("       Enter your Bedrock API Key directly — also supports")
-    print("       team scenarios where an admin distributes keys")
-    print()
-    try:
-        auth_choice = input("  Choice [1]: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return
-
-    if auth_choice == "2":
-        _model_flow_bedrock_api_key(config, region, current_model)
-        return
-
-    # 3. Model discovery — try live API first, fall back to static list
-    print(f"  Discovering models in {region}...")
-    live_models = discover_bedrock_models(region)
+    live_models = (
+        discover_bedrock_models(region, config=config_preview)
+        if discover_bedrock_models is not None
+        else []
+    )
 
     if live_models:
         _EXCLUDE_PREFIXES = (
@@ -4285,21 +4150,44 @@ def _model_flow_bedrock(config, current_model=""):
                 continue
             filtered.append(m)
 
-        # Deduplicate: prefer inference profiles (us.*, global.*) over bare
-        # foundation model IDs.
         profile_base_ids = set()
         for m in filtered:
             mid = m["id"]
-            if mid.startswith(("us.", "global.")):
-                base = mid.split(".", 1)[1] if "." in mid[3:] else mid
+            if mid.startswith(BEDROCK_INFERENCE_PROFILE_PREFIXES):
+                base = mid.split(".", 1)[1]
                 profile_base_ids.add(base)
 
         deduped = []
         for m in filtered:
             mid = m["id"]
-            if not mid.startswith(("us.", "global.")) and mid in profile_base_ids:
+            if (
+                not mid.startswith(BEDROCK_INFERENCE_PROFILE_PREFIXES)
+                and mid in profile_base_ids
+            ):
                 continue
             deduped.append(m)
+
+        # Inject 1M-context variants for Claude models that support them
+        # (Opus 4.7, Opus 4.6, Sonnet 4.6).  The ``:1m`` suffix triggers
+        # the ``context-1m-2025-08-07`` beta on the wire — see
+        # bedrock_adapter.split_bedrock_1m_suffix / CONTEXT_1M_BETA.
+        try:
+            from agent.bedrock_adapter import is_claude_1m_capable_model, CLAUDE_1M_SUFFIX
+        except ImportError:
+            is_claude_1m_capable_model = lambda _mid: False  # noqa: E731
+            CLAUDE_1M_SUFFIX = ":1m"
+        _one_m_variants = []
+        _seen_ids = {m["id"] for m in deduped}
+        for m in list(deduped):
+            mid = m["id"]
+            if not is_claude_1m_capable_model(mid):
+                continue
+            variant_id = mid + CLAUDE_1M_SUFFIX
+            if variant_id in _seen_ids:
+                continue
+            _seen_ids.add(variant_id)
+            _one_m_variants.append({**m, "id": variant_id})
+        deduped.extend(_one_m_variants)
 
         _RECOMMENDED = [
             "us.anthropic.claude-sonnet-4-6",
@@ -4330,48 +4218,260 @@ def _model_flow_bedrock(config, current_model=""):
     else:
         model_list = _PROVIDER_MODELS.get("bedrock", [])
         if model_list:
-            print(
-                f"  Using {len(model_list)} curated models (live discovery unavailable)"
-            )
+            print(f"  Using {len(model_list)} curated models (live discovery unavailable)")
         else:
-            print(
-                "  No models found. Check IAM permissions for bedrock:ListFoundationModels."
-            )
-            return
+            print("  No models found. Check IAM permissions for bedrock:ListFoundationModels.")
+            return None
 
-    # 4. Model selection
     if model_list:
-        selected = _prompt_model_selection(model_list, current_model=current_model)
+        return _prompt_model_selection(model_list, current_model=current_model)
+    try:
+        return input("  Model ID: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+
+def _save_bedrock_model_selection(selected, region, auth_method, profile=""):
+    from hermes_cli.auth import deactivate_provider
+    from hermes_cli.config import get_env_value, load_config, save_config, save_env_value
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = "bedrock"
+    model["base_url"] = f"https://bedrock-runtime.{region}.amazonaws.com"
+    model.pop("api_mode", None)
+
+    bedrock_cfg = cfg.get("bedrock", {})
+    if not isinstance(bedrock_cfg, dict):
+        bedrock_cfg = {}
+    bedrock_cfg["region"] = region
+    bedrock_cfg["auth_method"] = auth_method
+    if auth_method == "profile":
+        bedrock_cfg["profile"] = profile
+    else:
+        bedrock_cfg.pop("profile", None)
+    cfg["bedrock"] = bedrock_cfg
+
+    if get_env_value("OPENAI_BASE_URL"):
+        save_env_value("OPENAI_BASE_URL", "")
+    if get_env_value("OPENAI_API_KEY"):
+        save_env_value("OPENAI_API_KEY", "")
+    save_config(cfg)
+    deactivate_provider()
+
+
+def _model_flow_bedrock_api_key(
+    config,
+    region,
+    current_model="",
+):
+    """Configure native AWS Bedrock using the Bedrock bearer token."""
+    from hermes_cli.auth import _save_model_choice
+    from hermes_cli.config import (
+        get_env_value,
+        load_config,
+        save_env_value,
+    )
+
+    existing_key = get_env_value("AWS_BEARER_TOKEN_BEDROCK") or ""
+    if existing_key:
+        print(f"  Bedrock API Key: {existing_key[:12]}... ✓")
     else:
         try:
-            selected = input("  Model ID: ").strip()
+            import getpass
+
+            raw_key = getpass.getpass("  Bedrock API Key: ")
         except (KeyboardInterrupt, EOFError):
-            selected = None
+            print()
+            return
 
-    if selected:
-        _save_model_choice(selected)
+        # Defensive normalization: strip whitespace and optional "Bearer "
+        # prefix so common copy/paste mistakes (AWS console's Copy button,
+        # curl -H "Authorization: Bearer …" screenshots) don't silently break
+        # auth later.
+        try:
+            from agent.bedrock_adapter import _normalize_bedrock_bearer_token
+            api_key = _normalize_bedrock_bearer_token(raw_key)
+        except ImportError:
+            api_key = str(raw_key or "").strip()
+            if api_key.lower().startswith("bearer "):
+                api_key = api_key[7:].lstrip()
 
-        cfg = load_config()
-        model = cfg.get("model")
-        if not isinstance(model, dict):
-            model = {"default": model} if model else {}
-            cfg["model"] = model
-        model["provider"] = "bedrock"
-        model["base_url"] = f"https://bedrock-runtime.{region}.amazonaws.com"
-        model.pop("api_mode", None)  # bedrock_converse is auto-detected
+        if not api_key:
+            print("  Cancelled.")
+            return
+        if api_key != raw_key.strip():
+            print("  ℹ  Stripped ‘Bearer ’ prefix / whitespace from pasted token.")
+        save_env_value("AWS_BEARER_TOKEN_BEDROCK", api_key)
+        existing_key = api_key
+        print("  ✓ API key saved.")
+    print()
 
-        bedrock_cfg = cfg.get("bedrock", {})
-        if not isinstance(bedrock_cfg, dict):
-            bedrock_cfg = {}
-        bedrock_cfg["region"] = region
-        cfg["bedrock"] = bedrock_cfg
+    preview_cfg = load_config()
+    bedrock_preview = preview_cfg.get("bedrock", {})
+    if not isinstance(bedrock_preview, dict):
+        bedrock_preview = {}
+    bedrock_preview["region"] = region
+    bedrock_preview["auth_method"] = "api_key"
+    preview_cfg["bedrock"] = bedrock_preview
 
-        save_config(cfg)
-        deactivate_provider()
-
-        print(f"  Default model set to: {selected} (via AWS Bedrock, {region})")
-    else:
+    selected = _discover_bedrock_model_list(
+        region,
+        current_model=current_model,
+        config_preview=preview_cfg,
+    )
+    if not selected:
         print("  No change.")
+        return
+
+    _save_model_choice(selected)
+    _save_bedrock_model_selection(selected, region, "api_key")
+    print(f"  Default model set to: {selected} (via AWS Bedrock API Key, {region})")
+
+
+def _model_flow_bedrock(config, current_model=""):
+    """AWS Bedrock provider: auth selection, region selection, and model discovery."""
+    from hermes_cli.auth import _save_model_choice
+    from hermes_cli.config import (
+        get_env_value,
+        load_config,
+        save_env_value,
+    )
+
+    try:
+        from agent.bedrock_adapter import (
+            has_aws_credentials,
+            resolve_aws_auth_env_var,
+            resolve_bedrock_region,
+        )
+    except ImportError:
+        print("  ✗ boto3 is not installed. Install it with:")
+        print("    pip install boto3")
+        print()
+        return
+
+    current_region = resolve_bedrock_region()
+    try:
+        region_input = input(f"  AWS Region [{current_region}]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+    region = region_input or current_region
+
+    print("  Choose authentication method:")
+    print()
+    print("    1. Bedrock API Key")
+    print("       Use AWS_BEARER_TOKEN_BEDROCK as the only Bedrock auth source")
+    print("    2. AWS Profile")
+    print("       Use a named AWS profile from your local AWS config")
+    print("    3. AWS Credentials")
+    print("       Enter AWS access key, secret key, and optional session token")
+    print("    4. Default AWS credential chain")
+    print("       Use env vars, SSO, IMDS, ECS task role, or Lambda role")
+    print()
+    try:
+        auth_choice = input("  Choice [4]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+
+    if auth_choice == "1":
+        _model_flow_bedrock_api_key(
+            config,
+            region,
+            current_model,
+        )
+        return
+
+    preview_cfg = load_config()
+    bedrock_preview = preview_cfg.get("bedrock", {})
+    if not isinstance(bedrock_preview, dict):
+        bedrock_preview = {}
+    bedrock_preview["region"] = region
+
+    auth_method = "default_chain"
+    profile = ""
+
+    if auth_choice == "2":
+        existing_profile = (
+            str(bedrock_preview.get("profile") or "").strip()
+            or str(get_env_value("AWS_PROFILE") or "").strip()
+        )
+        try:
+            profile = input(f"  AWS Profile [{existing_profile or 'default'}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+        profile = profile or existing_profile or "default"
+        auth_method = "profile"
+        bedrock_preview["profile"] = profile
+    elif auth_choice == "3":
+        try:
+            import getpass
+
+            access_key = (
+                input(
+                    f"  AWS Access Key ID [{(get_env_value('AWS_ACCESS_KEY_ID') or '')[:8]}]: "
+                ).strip()
+                or (get_env_value("AWS_ACCESS_KEY_ID") or "").strip()
+            )
+            secret_key = getpass.getpass("  AWS Secret Access Key: ").strip() or (
+                get_env_value("AWS_SECRET_ACCESS_KEY") or ""
+            ).strip()
+            session_token = getpass.getpass(
+                "  AWS Session Token (optional): "
+            ).strip() or (get_env_value("AWS_SESSION_TOKEN") or "").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+        if not access_key or not secret_key:
+            print("  AWS credentials require both access key and secret key.")
+            return
+        auth_method = "credentials"
+        os.environ["AWS_ACCESS_KEY_ID"] = access_key
+        os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
+        if session_token:
+            os.environ["AWS_SESSION_TOKEN"] = session_token
+        else:
+            os.environ.pop("AWS_SESSION_TOKEN", None)
+    else:
+        if not has_aws_credentials():
+            print("  ⚠ No AWS credentials detected via environment variables.")
+            print("  Bedrock will rely on boto3's default credential chain (IMDS, SSO, etc.)")
+        auth_var = resolve_aws_auth_env_var()
+        if auth_var:
+            print(f"  AWS credentials: {auth_var} ✓")
+        else:
+            print("  AWS credentials: boto3 default chain (instance role / SSO)")
+        auth_method = "default_chain"
+
+    bedrock_preview["auth_method"] = auth_method
+    preview_cfg["bedrock"] = bedrock_preview
+
+    print()
+    print(f"  Discovering models in {region}...")
+    selected = _discover_bedrock_model_list(
+        region,
+        current_model=current_model,
+        config_preview=preview_cfg,
+    )
+    if not selected:
+        print("  No change.")
+        return
+
+    if auth_method == "profile":
+        save_env_value("AWS_PROFILE", profile)
+    elif auth_method == "credentials":
+        save_env_value("AWS_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID", ""))
+        save_env_value("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", ""))
+        save_env_value("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
+
+    _save_model_choice(selected)
+    _save_bedrock_model_selection(selected, region, auth_method, profile=profile)
+    print(f"  Default model set to: {selected} (via AWS Bedrock, {region})")
 
 
 def _model_flow_api_key_provider(config, provider_id, current_model=""):

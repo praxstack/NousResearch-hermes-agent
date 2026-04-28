@@ -370,7 +370,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="AWS Bedrock",
         auth_type="aws_sdk",
         inference_base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
-        api_key_env_vars=(),
+        api_key_env_vars=("AWS_BEARER_TOKEN_BEDROCK",),
         base_url_env_var="BEDROCK_BASE_URL",
     ),
     "azure-foundry": ProviderConfig(
