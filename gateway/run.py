@@ -3612,26 +3612,37 @@ class GatewayRunner:
                 return True
             if enabled_platform_count > 0:
                 if startup_retryable_errors:
-                    # At least one platform attempted a connection and failed —
-                    # this is a real startup error that should block the gateway.
+                    # At least one platform attempted a connection and failed.
+                    # Case A (ours): if _failed_platforms is non-empty, the errors are
+                    # RETRYABLE (network outage, DNS during Mac sleep, etc). Stay alive
+                    # so cron still runs and the background reconnection loop can recover.
+                    # Case B (upstream): genuine unrecoverable startup error — exit.
                     reason = "; ".join(startup_retryable_errors)
-                    logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
-                    try:
-                        from gateway.status import write_runtime_status
-                        write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                    except Exception:
-                        pass
-                    return False
-                # All enabled platforms had no adapter (missing library or credentials).
-                # In fleet deployments the same config.yaml is shared across nodes that
-                # may only have credentials for a subset of platforms.  Rather than
-                # failing hard, degrade gracefully and allow cron jobs to run (#5196).
-                logger.warning(
-                    "No adapter could be created for any of the %d configured platform(s). "
-                    "Check that required dependencies are installed and credentials are set. "
-                    "Gateway will continue for cron job execution.",
-                    enabled_platform_count,
-                )
+                    if self._failed_platforms:
+                        logger.warning(
+                            "All messaging platforms failed to connect (%s), but staying alive "
+                            "for cron execution and background reconnection (%d platform(s) queued)",
+                            reason, len(self._failed_platforms),
+                        )
+                    else:
+                        logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
+                        try:
+                            from gateway.status import write_runtime_status
+                            write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+                        except Exception:
+                            pass
+                        return False
+                else:
+                    # All enabled platforms had no adapter (missing library or credentials).
+                    # In fleet deployments the same config.yaml is shared across nodes that
+                    # may only have credentials for a subset of platforms. Degrade gracefully
+                    # and allow cron jobs to run (#5196).
+                    logger.warning(
+                        "No adapter could be created for any of the %d configured platform(s). "
+                        "Check that required dependencies are installed and credentials are set. "
+                        "Gateway will continue for cron job execution.",
+                        enabled_platform_count,
+                    )
             else:
                 logger.warning("No messaging platforms enabled.")
                 logger.info("Gateway will continue running for cron job execution.")
@@ -7739,9 +7750,13 @@ class GatewayRunner:
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
+            _hook_adapter = self.adapters.get(source.platform) if source.platform else None
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
+                "messages": agent_messages,
+                "adapter": _hook_adapter,
+                "chat_id": str(source.chat_id),
             })
             
             # Check for pending process watchers (check_interval on background processes)
