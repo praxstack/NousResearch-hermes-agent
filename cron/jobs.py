@@ -263,7 +263,7 @@ def _compute_grace_seconds(schedule: dict) -> int:
     while frequent jobs (every 5-10 min) still fast-forward quickly.
     """
     MIN_GRACE = 120
-    MAX_GRACE = 7200  # 2 hours
+    MAX_GRACE = 43200  # 12 hours — laptop sleeps overnight, catch up on wake
 
     kind = schedule.get("kind")
 
