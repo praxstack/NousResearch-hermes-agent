@@ -2318,6 +2318,19 @@ class HermesCLI:
         model_short = model_name.split("/")[-1] if "/" in model_name else model_name
         if model_short.endswith(".gguf"):
             model_short = model_short[:-5]
+        # Bedrock inference profile IDs are verbose: "global.anthropic.claude-opus-4-7:1m"
+        # Shorten to something readable like "Claude Opus 4.7 1M" or "claude-opus-4-7:1m"
+        _bedrock_prefixes = ("global.", "us.", "eu.", "apac.", "au.", "jp.", "anthropic.")
+        if any(model_short.startswith(p) for p in _bedrock_prefixes):
+            # Strip region/vendor prefix: "global.anthropic.claude-opus-4-7:1m" → "claude-opus-4-7:1m"
+            _stripped = model_short
+            for _p in ("global.", "us.", "eu.", "apac.", "au.", "jp."):
+                if _stripped.startswith(_p):
+                    _stripped = _stripped[len(_p):]
+                    break
+            if _stripped.startswith("anthropic."):
+                _stripped = _stripped[len("anthropic."):]
+            model_short = _stripped  # e.g. "claude-opus-4-7:1m" (18 chars — fits fine)
         if len(model_short) > 26:
             model_short = f"{model_short[:23]}..."
 
