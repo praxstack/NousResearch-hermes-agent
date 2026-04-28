@@ -4052,10 +4052,10 @@ def _run_anthropic_oauth_flow(save_env_value):
         print()
         print("  If the setup-token was displayed above, paste it here:")
         print()
-        from hermes_cli.secret_prompt import masked_secret_prompt
-
         try:
-            manual_token = masked_secret_prompt(
+            import getpass
+
+            manual_token = getpass.getpass(
                 "  Paste setup-token (or Enter to cancel): "
             ).strip()
         except (KeyboardInterrupt, EOFError):
@@ -4083,10 +4083,10 @@ def _run_anthropic_oauth_flow(save_env_value):
         print()
         print("  Or paste an existing setup-token now (sk-ant-oat-...):")
         print()
-        from hermes_cli.secret_prompt import masked_secret_prompt
-
         try:
-            token = masked_secret_prompt("  Setup-token (or Enter to cancel): ").strip()
+            import getpass
+
+            token = getpass.getpass("  Setup-token (or Enter to cancel): ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             return False
