@@ -1644,6 +1644,83 @@ def run_doctor(args):
         for _issue in _issues_to_add:
             issues.append(_issue)
 
+    # -- Extended Bedrock configuration dump (parity patch) --
+    # Print a detailed ◆ Bedrock Configuration section with auth mode, region,
+    # model, CRI/global/caching, and endpoint. The parallel _probe_bedrock above
+    # only covers connectivity; this section gives the full config context
+    # which is essential for debugging region/CRI desync (MEMORY.md regression).
+    try:
+        from agent.bedrock_adapter import (
+            has_aws_credentials,
+            resolve_aws_auth_env_var,
+            resolve_bedrock_auth_config,
+            resolve_bedrock_region,
+        )
+        try:
+            from hermes_cli.config import load_config as _load_cfg_for_bedrock
+            _bedrock_full_cfg = _load_cfg_for_bedrock()
+        except Exception:
+            _bedrock_full_cfg = cfg if isinstance(locals().get("cfg"), dict) else {}
+        _bedrock_section = _bedrock_full_cfg.get("bedrock", {}) if isinstance(_bedrock_full_cfg, dict) else {}
+        _model_section_raw = _bedrock_full_cfg.get("model", {}) if isinstance(_bedrock_full_cfg, dict) else {}
+        _model_section = _model_section_raw if isinstance(_model_section_raw, dict) else {}
+
+        # Is Bedrock the active provider?
+        _active_provider = str(_model_section.get("provider") or "").strip().lower()
+        _configured_model = str(_model_section.get("default") or "").strip()
+        _is_bedrock_active = _active_provider == "bedrock"
+
+        if has_aws_credentials() or _is_bedrock_active:
+            print()
+            print(color("◆ Bedrock Configuration", Colors.CYAN, Colors.BOLD))
+
+            # Auth method
+            try:
+                _auth_config = resolve_bedrock_auth_config(config=_bedrock_full_cfg)
+                _auth_method = _auth_config.get("method", "default_chain")
+                _region = _auth_config.get("region") or resolve_bedrock_region()
+                _auth_source = _auth_config.get("source", "aws-sdk-default-chain")
+                _endpoint_url = _auth_config.get("endpoint_url", "")
+            except RuntimeError as _auth_err:
+                _auth_method = "?"
+                _region = str(_bedrock_section.get("region") or resolve_bedrock_region())
+                _auth_source = f"error: {_auth_err}"
+                _endpoint_url = ""
+
+            _auth_display = {
+                "api_key": "Bedrock API Key (AWS_BEARER_TOKEN_BEDROCK)",
+                "profile": f"AWS Profile ({_bedrock_section.get('profile') or 'default'})",
+                "credentials": "AWS Access Key + Secret",
+                "default_chain": "AWS default credential chain (env / SSO / IMDS)",
+            }.get(_auth_method, _auth_method)
+
+            check_ok("Auth method", f"({_auth_display})")
+            check_ok("Region", f"({_region})")
+            if _endpoint_url:
+                check_ok("VPC endpoint", f"({_endpoint_url})")
+
+            # Active model
+            if _configured_model:
+                _is_1m = _configured_model.endswith(":1m")
+                _model_note = " [1M context window]" if _is_1m else " [200K context window]"
+                check_ok("Active model", f"({_configured_model}{_model_note})")
+            else:
+                check_warn("No Bedrock model configured", "(run: hermes model → Amazon Bedrock)")
+
+            # Inference profile flags
+            _cri = _bedrock_section.get("use_cross_region_inference", None)
+            _global = _bedrock_section.get("use_global_inference_profile", None)
+            _cache = _bedrock_section.get("use_prompt_caching", None)
+            if _cri is None:
+                check_warn("Cross-region inference", "(not set — run: hermes model to configure)")
+            else:
+                check_ok(f"Cross-region inference", f"({'enabled' if _cri else 'disabled'})")
+                if _cri:
+                    check_ok("Global inference profile", f"({'enabled' if _global else 'disabled'})")
+            check_ok("Prompt caching", f"({'enabled' if _cache else ('disabled' if _cache is False else 'not set')})")
+    except ImportError:
+        pass  # bedrock_adapter not available — skip silently
+
     # =========================================================================
     # Check: Tool Availability
     # =========================================================================
