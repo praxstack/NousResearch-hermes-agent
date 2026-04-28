@@ -1148,13 +1148,25 @@ class TestBedrockErrorClassification:
 class TestBedrockContextLength:
     """Test Bedrock model context length lookup."""
 
-    def test_claude_opus_4_7_uses_full_bedrock_window(self):
+    def test_claude_opus_4_7_default_is_200k(self):
+        """Opus 4.7 on Bedrock defaults to 200K — 1M requires :1m suffix."""
         from agent.bedrock_adapter import get_bedrock_context_length
-        assert get_bedrock_context_length("anthropic.claude-opus-4-7") == 1_000_000
+        assert get_bedrock_context_length("anthropic.claude-opus-4-7") == 200_000
 
-    def test_claude_opus_4_7_global_profile_uses_full_bedrock_window(self):
+    def test_claude_opus_4_7_1m_variant_is_1m(self):
+        """Opus 4.7 with :1m suffix returns 1M context."""
         from agent.bedrock_adapter import get_bedrock_context_length
-        assert get_bedrock_context_length("global.anthropic.claude-opus-4-7") == 1_000_000
+        assert get_bedrock_context_length("anthropic.claude-opus-4-7:1m") == 1_000_000
+
+    def test_claude_opus_4_7_global_profile_default(self):
+        """Global inference profile: Opus 4.7 defaults to 200K."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("global.anthropic.claude-opus-4-7") == 200_000
+
+    def test_claude_sonnet_4_6_1m_variant(self):
+        """Sonnet 4.6 :1m variant returns 1M context."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-sonnet-4-6:1m") == 1_000_000
 
     def test_claude_opus_4_6(self):
         from agent.bedrock_adapter import get_bedrock_context_length
