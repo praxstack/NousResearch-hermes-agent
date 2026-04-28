@@ -113,18 +113,20 @@ def invalidate_runtime_client(region: str) -> bool:
 
     Returns True if any cached entry was evicted, False if the region had no
     cached clients. Handles both the legacy bare-region cache key and the
-    composite ``bedrock-runtime|<region>|<auth-hash>`` form used after the
-    Apr 2026 auth-config refactor — evicting every entry whose key matches
-    the given region.
+    composite ``bedrock-runtime:<region>:<auth-hash>`` form used after the
+    Apr 2026 auth-config refactor — evicting every entry whose key starts with
+    ``bedrock-runtime:<region>:`` (the canonical composite prefix).
     """
     evicted = False
     # Legacy bare-region entries (tests + pre-refactor code paths).
     if region in _bedrock_runtime_client_cache:
         _bedrock_runtime_client_cache.pop(region, None)
         evicted = True
-    # Composite entries: "bedrock-runtime|<region>|<auth-hash>".
-    for key in [k for k in _bedrock_runtime_client_cache
-                if isinstance(k, str) and f"|{region}|" in k]:
+    # Composite entries: "bedrock-runtime:<region>:<method>:<identity>".
+    # The key is built by _bedrock_client_cache_key as ":".join(parts).
+    composite_prefix = f"bedrock-runtime:{region}:"
+    for key in [k for k in list(_bedrock_runtime_client_cache)
+                if isinstance(k, str) and k.startswith(composite_prefix)]:
         _bedrock_runtime_client_cache.pop(key, None)
         evicted = True
     return evicted

@@ -1371,6 +1371,45 @@ class TestInvalidateRuntimeClient:
         reset_client_cache()
         assert invalidate_runtime_client("eu-west-1") is False
 
+    def test_evicts_composite_key(self):
+        """Composite cache keys (post-Apr-2026 auth-config refactor) must be evicted.
+
+        Real cache keys are ``bedrock-runtime:<region>:<method>:<identity>`` built by
+        ``_bedrock_client_cache_key``.  Bare-region eviction must handle both forms.
+        """
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            reset_client_cache,
+        )
+        reset_client_cache()
+        composite_key = "bedrock-runtime:us-east-1:api_key:api_key:abcd1234"
+        other_key = "bedrock-runtime:eu-west-1:api_key:api_key:efgh5678"
+        _bedrock_runtime_client_cache[composite_key] = "dead-client"
+        _bedrock_runtime_client_cache[other_key] = "live-client"
+
+        evicted = invalidate_runtime_client("us-east-1")
+
+        assert evicted is True, "must evict composite key for us-east-1"
+        assert composite_key not in _bedrock_runtime_client_cache
+        assert _bedrock_runtime_client_cache[other_key] == "live-client", "other region untouched"
+
+    def test_evicts_both_bare_and_composite_for_same_region(self):
+        """If both bare and composite keys coexist for the same region, both evicted."""
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            reset_client_cache,
+        )
+        reset_client_cache()
+        _bedrock_runtime_client_cache["us-east-1"] = "bare-client"
+        _bedrock_runtime_client_cache["bedrock-runtime:us-east-1:default_chain:default_chain"] = "composite-client"
+
+        evicted = invalidate_runtime_client("us-east-1")
+
+        assert evicted is True
+        assert not any("us-east-1" in k for k in _bedrock_runtime_client_cache)
+
 
 class TestIsStaleConnectionError:
     """Classifier that decides whether an exception warrants client eviction."""
