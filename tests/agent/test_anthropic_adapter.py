@@ -28,6 +28,40 @@ from agent.transports import get_transport
 
 
 # ---------------------------------------------------------------------------
+# Keychain isolation — MUST apply to all credential-resolution tests.
+#
+# `read_claude_code_credentials()` checks the macOS Keychain first
+# (`security find-generic-password -s "Claude Code-credentials" -w`) and only
+# falls back to ~/.claude/.credentials.json when the Keychain entry is missing.
+# On dev machines with Claude Code installed (macOS >= 2.1.114) the Keychain
+# returns real OAuth credentials, which leaks into tests that `monkeypatch`
+# only the filesystem path.
+#
+# Tests that intend to exercise the file-based code path explicitly opt into
+# this fixture via `usefixtures`. Tests that want to exercise the Keychain
+# path (if any) are free to patch `_read_claude_code_credentials_from_keychain`
+# themselves.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _isolate_claude_keychain():
+    """Force the macOS Keychain credential path to return None.
+
+    Without this, `read_claude_code_credentials()` and downstream helpers pick
+    up real credentials from the dev machine's Keychain, bypassing the
+    `monkeypatch.setattr(Path.home, ...)` that tests use for filesystem
+    isolation. Apply to any test that expects credentials to be read from a
+    tmp_path-scoped ~/.claude/.credentials.json.
+    """
+    with patch(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        return_value=None,
+    ):
+        yield
+
+
+# ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 
@@ -106,9 +140,15 @@ class TestBuildAnthropicClient:
 
     def test_custom_base_url(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client("sk-ant-api03-x", base_url="https://custom.api.com")
+            build_anthropic_client("***", base_url="https://custom.api.com")
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["base_url"] == "https://custom.api.com"
+            # Native Bedrock CR (20260428): `context-1m-2025-08-07` is emitted
+            # by default on OAuth-token clients (including custom base_url) so
+            # downstream Bedrock/Anthropic proxies that honor the 1M beta do
+            # so transparently. `oauth-2025-04-20` and `claude-code-20250219`
+            # stay OFF for custom base_urls (those are first-party OAuth betas,
+            # not relevant to self-hosted proxies).
             assert kwargs["default_headers"] == {
                 "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07"
             }
@@ -192,6 +232,7 @@ class TestBuildAnthropicBedrockClient:
         assert "aws_profile" not in kwargs
 
 
+@pytest.mark.usefixtures("_isolate_claude_keychain")
 class TestReadClaudeCodeCredentials:
     def test_reads_valid_credentials(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
@@ -253,6 +294,7 @@ class TestIsClaudeCodeTokenValid:
         assert is_claude_code_token_valid(creds) is True
 
 
+@pytest.mark.usefixtures("_isolate_claude_keychain")
 class TestResolveAnthropicToken:
     def test_prefers_oauth_token_over_api_key(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
@@ -461,6 +503,7 @@ class TestResolveWithRefresh:
         assert result == "refreshed-token"
 
 
+@pytest.mark.usefixtures("_isolate_claude_keychain")
 class TestRunOauthSetupToken:
     def test_raises_when_claude_not_installed(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda _: None)
