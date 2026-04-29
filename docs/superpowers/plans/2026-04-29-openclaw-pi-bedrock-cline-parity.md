@@ -6,6 +6,11 @@
 
 **Architecture:** One canonical `BedrockAuthConfig` contract shared between both tools (TypeScript types match field-for-field). Auth resolution is a pure dispatch on `mode`. Streaming preserves reasoningContent deltas (text + signature). Local patches live under each tool's own data dir (`~/.openclaw/patches/dist/`, `~/.pi/patches/dist/`) and are reapplied by the existing Hermes post-update hook when markers are missing from the installed bundle. Forks live under `github.com/praxstack`.
 
+**IMPORTANT — ARCHITECTURE DISCOVERY (2026-04-29, revision 2):** OpenClaw depends on `@mariozechner/pi-ai` for the actual Bedrock inference (`streamBedrock` in `node_modules/@mariozechner/pi-ai/dist/providers/amazon-bedrock.js`). OpenClaw's `extensions/amazon-bedrock/` is a control-plane shim that registers capability metadata, guardrails wrappers, prompt-cache matchers, and a memory-embedding adapter on top of pi-ai. It does NOT own the `ConverseStreamCommand` call for chat. Therefore:
+- **Phase B (Pi) does the real inference work.** Four-mode auth, VPC endpoint, 1M beta, streaming-reasoning signatures land in `pi-mono/packages/ai/src/providers/amazon-bedrock.ts`.
+- **Phase A (OpenClaw) is lighter than originally scoped.** OpenClaw work is now: (1) declare the Cline-parity config surface in the plugin manifest, (2) extend `BedrockAuthConfig` as the provider-plugin contract (already done in A.1), (3) sync `matchesPiAiPromptCachingModelId` + adaptive-thinking capability flags with pi-ai's new surface, (4) bump `@mariozechner/pi-ai` pin once the Pi PR merges, (5) docs + PR.
+- **Execution order changes:** run Phase B first on pi-mono (hard implementation), then run a rescoped Phase A on OpenClaw once pi-ai's public surface is finalized.
+
 **Tech Stack:** TypeScript, `@aws-sdk/client-bedrock-runtime` v3.798+, `@aws-sdk/credential-providers`, `@smithy/node-http-handler`, vitest (Pi) + whatever OpenClaw uses (likely vitest/jest), React Ink for CLI UIs, Python for the Hermes patch guard.
 
 ---
