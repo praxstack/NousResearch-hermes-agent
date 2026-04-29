@@ -178,11 +178,10 @@ anthropic.claude-sonnet-4-6
 | H4 | Confirm `use_cross_region_inference` AND `use_global_inference_profile` are exposed as **two** independent booleans (Cline shows both checkboxes). | `hermes_cli/runtime_provider.py`, `hermes_cli/main.py` |
 | H5 | Add missing failing test if not already present: `test_bedrock_auth_modes_are_disjoint` — verifies selecting one mode clears the other modes' fields on save. | `tests/agent/test_bedrock_adapter.py` |
 | H6 | Update `BEDROCK_CR_MARKERS` in `hooks/post-update-patches/handler.py` to include any new needles introduced since 2026-04-27. | `~/.hermes/hooks/post-update-patches/handler.py` |
-| H7 | Extend `_pin_bedrock_model_chain` in the post-update handler to also write the full `bedrock:` block (all 13 `BedrockAuthConfig` fields) into `~/.hermes/config.yaml` and every `~/.hermes/profiles/*/config.yaml`. Preserve existing user-set values on re-run (merge, don't clobber) for the four auth-secret fields: `api_key`, `access_key_id`, `secret_access_key`, `session_token`. Hard-pin non-secret structural fields: `mode` (if unset → `"default_chain"`), `region` (if unset → `"us-east-1"`), `use_cross_region_inference: true`, `use_global_inference_profile: true`, `prompt_caching: true`, `adaptive_thinking: "high"`, `enable_1m_context: true`. | `~/.hermes/hooks/post-update-patches/handler.py` |
-| H8 | Add `BEDROCK_CONFIG_SCHEMA_VERSION = 2` sentinel to the handler and every `config.yaml` it writes. If version < 2 on read, run the migration (see §6.3) that converts legacy `{type: "api_key", key: "..."}` entries into the new shape before the pin step overwrites. | `~/.hermes/hooks/post-update-patches/handler.py` |
-| H9 | Write a unit test for `_pin_bedrock_model_chain` that: (a) starts with an empty config → asserts all 13 fields are present with defaults; (b) starts with user-set `api_key` → asserts value is preserved; (c) runs twice → asserts idempotent. | `tests/hermes_cli/test_post_update_patches.py` (new file if absent) |
 
-**Exit criteria:** All existing 459 tests pass + the new gap tests (H5, H9) pass. `hermes doctor` reports Bedrock OK. CR markers all present after a mock `hermes update` cycle. A fresh profile created after the pin step has a complete, schema-version-2 `bedrock:` block; an existing profile with a user-set `api_key` retains it unchanged.
+**Deferred (not in this spec's implementation scope):** Expansion of `_pin_bedrock_model_chain` to write the full 13-field `bedrock:` block, schema-version sentinel, and migration of legacy config shapes. User will review these with the Hermes team separately.
+
+**Exit criteria:** All existing 459 tests pass + the new gap tests pass. `hermes doctor` reports Bedrock OK. CR markers all present after a mock `hermes update` cycle.
 
 ### 5.2 OpenClaw (TypeScript)
 
@@ -778,9 +777,7 @@ At ERROR:
 - [ ] Finalize `.markers.json` needles by `npm run build`-ing each fork, greping the dist output for string literals that survived minification, and replacing representative needles in §9.2 with the real ones
 - [ ] Add `_check_openclaw_dist_markers` / `_reapply_openclaw_dist_patches` / Pi equivalents to `~/.hermes/hooks/post-update-patches/handler.py` (or sibling file) that read patches from each tool's own data dir
 - [ ] Wire into `handle()` function
-- [ ] Extend `_pin_bedrock_model_chain` per H7 (13-field `bedrock:` block with merge-preserve semantics for secrets)
-- [ ] Add `BEDROCK_CONFIG_SCHEMA_VERSION = 2` migration per H8
-- [ ] Write unit tests for marker detection, reapply, pin, and migration
+- [ ] Write unit tests for marker detection and reapply
 - [ ] Simulate a `hermes update` + verify guard runs and passes
 
 ### Phase F — Documentation & handoff
@@ -808,9 +805,11 @@ Flag explicitly: these are deliberately not included in this spec's scope.
 - **Sections:** 15 plus cheat-sheet + checklist
 - **Line count:** ~1000
 - **Revision 2 changes (2026-04-29, post-review):**
-  - Expanded §5.1 Hermes with H7/H8/H9 — `_pin_bedrock_model_chain` now writes the full 13-field `bedrock:` block with merge-preserve semantics for secrets and an explicit `BEDROCK_CONFIG_SCHEMA_VERSION = 2` sentinel for idempotent migration.
   - §9.3 patch layout moved from `~/.hermes/patches/dist/` to per-tool dirs (`~/.openclaw/patches/dist/`, `~/.pi/patches/dist/`). Hermes owns the runner, each tool owns its patch files.
   - Fork destination pinned to `github.com/praxstack`.
   - Phase E checklist: added marker finalization step (resolves the §9.2 minified-needle TBD by building the fork's dist and greping for surviving string literals).
+- **Revision 3 changes (2026-04-29):**
+  - **Implementation scope narrowed to OpenClaw + Pi only.** Hermes track is verification (H1-H6) only; expansion of `_pin_bedrock_model_chain` is deferred for separate review with the Hermes team.
+  - Implementation plan will focus on driving OpenClaw and Pi to 100% Cline parity end-to-end, including upstream PRs and local patch guards for their installed dist bundles.
 - **Remaining `[TBD]`:** The exact minified needles in §9.2 resolve during Phase E after `npm run build` of each fork; this is an implementation artifact, not a spec gap.
 - **Confidence:** Ready for implementation.
