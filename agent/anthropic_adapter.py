@@ -116,7 +116,7 @@ _ANTHROPIC_OUTPUT_LIMITS = {
 _ANTHROPIC_DEFAULT_OUTPUT_LIMIT = 128_000
 
 
-def _get_anthropic_max_output(model: str) -> int:
+def _get_anthropic_max_output(model: str, *, batch_mode: bool = False) -> int:
     """Look up the max output token limit for an Anthropic model.
 
     Uses substring matching against _ANTHROPIC_OUTPUT_LIMITS so date-stamped
@@ -126,8 +126,16 @@ def _get_anthropic_max_output(model: str) -> int:
 
     Normalizes dots to hyphens so that model names like
     ``anthropic/claude-opus-4.6`` match the ``claude-opus-4-6`` table key.
+
+    When ``batch_mode`` is True and the model supports the output-300k
+    beta (Opus 4.6/4.7 + Sonnet 4.6), return 300_000 — the Message
+    Batches API allows significantly higher per-call output ceilings
+    with the output-300k-2026-03-24 beta header. Non-supported models
+    fall through to the synchronous ceiling even in batch mode.
     """
     m = model.lower().replace(".", "-")
+    if batch_mode and _supports_output_300k(model):
+        return 300_000
     best_key = ""
     best_val = _ANTHROPIC_DEFAULT_OUTPUT_LIMIT
     for key, val in _ANTHROPIC_OUTPUT_LIMITS.items():
@@ -167,6 +175,8 @@ def _resolve_anthropic_messages_max_tokens(
     requested,
     model: str,
     context_length: Optional[int] = None,
+    *,
+    batch_mode: bool = False,
 ) -> int:
     """Resolve the ``max_tokens`` budget for an Anthropic Messages call.
 
@@ -180,12 +190,17 @@ def _resolve_anthropic_messages_max_tokens(
     not, to keep the positive-value contract independent of endpoint
     specifics.
 
+    When ``batch_mode`` is True the fallback ceiling is pulled from the
+    Batches-API table (300k for Opus 4.6/4.7, Sonnet 4.6). An explicit
+    ``requested`` value still wins — batch_mode only changes the default
+    for callers that didn't specify.
+
     Ported from openclaw/openclaw#66664 (resolveAnthropicMessagesMaxTokens).
     """
     resolved = _resolve_positive_anthropic_max_tokens(requested)
     if resolved is not None:
         return resolved
-    fallback = _get_anthropic_max_output(model)
+    fallback = _get_anthropic_max_output(model, batch_mode=batch_mode)
     if fallback > 0:
         return fallback
     raise ValueError(
@@ -264,6 +279,37 @@ _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 # significantly higher output token throughput on Opus 4.6 (~2.5x).
 # See https://platform.claude.com/docs/en/build-with-claude/fast-mode
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
+
+# Output-300k beta — raises the ``max_tokens`` ceiling on the Message
+# Batches API to 300,000 output tokens. Applies to Opus 4.7, Opus 4.6,
+# and Sonnet 4.6. Without this beta the batch API caps these models
+# at 128k/128k/64k respectively. Only meaningful on the Batches
+# endpoint — on the synchronous Messages API it is accepted but
+# ignored, since the sync API enforces the per-model ceiling. See
+# https://docs.claude.com/en/release-notes/api (March 30 2026).
+_OUTPUT_300K_BETA = "output-300k-2026-03-24"
+
+# Models that accept the ``output-300k-2026-03-24`` beta. Substring
+# match against the normalized model id (lowercase, dots → hyphens).
+# Opus 4.7, Opus 4.6, Sonnet 4.6 are the announced-supported models;
+# date-stamped variants (claude-sonnet-4-6-20260xxx) match via substring.
+_OUTPUT_300K_CAPABLE_SUBSTRINGS = (
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+)
+
+
+def _supports_output_300k(model: str) -> bool:
+    """Return True when the model accepts the output-300k-2026-03-24 beta.
+
+    Substring match so date-stamped variants (e.g. claude-sonnet-4-6-20260xxx)
+    and Bedrock model IDs (anthropic.claude-opus-4-7, global.anthropic.*)
+    resolve correctly. Normalizes dots to hyphens so qwen/claude-opus-4.7
+    style external model strings match too.
+    """
+    m = model.lower().replace(".", "-")
+    return any(sub in m for sub in _OUTPUT_300K_CAPABLE_SUBSTRINGS)
 
 # Additional beta headers required for OAuth/subscription auth.
 # Matches what Claude Code (and pi-ai / OpenCode) send.
@@ -1817,6 +1863,7 @@ def build_anthropic_kwargs(
     base_url: str | None = None,
     fast_mode: bool = False,
     drop_context_1m_beta: bool = False,
+    batch_mode: bool = False,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -1884,7 +1931,7 @@ def build_anthropic_kwargs(
     # fractional floats, NaN, non-numeric) fail locally with a clear error
     # rather than 400-ing at the Anthropic API. See openclaw/openclaw#66664.
     effective_max_tokens = _resolve_anthropic_messages_max_tokens(
-        max_tokens, model, context_length=context_length
+        max_tokens, model, context_length=context_length, batch_mode=batch_mode
     )
 
     # Clamp output cap to fit inside the total context window.
@@ -2048,6 +2095,25 @@ def build_anthropic_kwargs(
         if _BEDROCK_1M_BETA not in existing_betas:
             existing_betas.append(_BEDROCK_1M_BETA)
         # Preserve the rest of extra_headers.
+        new_headers = dict(existing)
+        new_headers["anthropic-beta"] = ",".join(existing_betas)
+        kwargs["extra_headers"] = new_headers
+
+    # ── Output-300k beta (Batches API only) ───────────────────────────
+    # When the caller flagged batch_mode, attach the output-300k beta
+    # header for models that support it (Opus 4.7/4.6, Sonnet 4.6).
+    # The sync Messages API ignores the header harmlessly, but we gate
+    # on batch_mode anyway so the header is only sent when a batches
+    # caller explicitly asked for it — keeps the wire clean for sync.
+    # Non-supported models are a no-op: no header attached, and the
+    # max_tokens cap already fell back to the model's sync ceiling
+    # (see _get_anthropic_max_output).
+    if batch_mode and _supports_output_300k(model):
+        existing = kwargs.get("extra_headers", {}) or {}
+        existing_beta = str(existing.get("anthropic-beta", "") or "")
+        existing_betas = [b.strip() for b in existing_beta.split(",") if b.strip()]
+        if _OUTPUT_300K_BETA not in existing_betas:
+            existing_betas.append(_OUTPUT_300K_BETA)
         new_headers = dict(existing)
         new_headers["anthropic-beta"] = ",".join(existing_betas)
         kwargs["extra_headers"] = new_headers
