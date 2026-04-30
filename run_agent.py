@@ -2805,6 +2805,23 @@ class AIAgent:
             and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
         )
 
+        # Bedrock Claude: honour ``bedrock.use_prompt_caching`` config toggle.
+        # The wizard writes this flag (hermes_cli/main.py:4278) but previously
+        # only the Converse adapter read it; the AnthropicBedrock path always
+        # cached regardless. Respect the user's disable by returning early
+        # before the generic Claude-on-Anthropic-wire enabling branch below.
+        # Default is True (matches wizard default + historical behaviour), so
+        # existing users without the key set see no change.
+        if is_anthropic_wire and is_claude and provider_lower == "bedrock":
+            try:
+                from hermes_cli.config import load_config as _load_bedrock_cfg
+                _bedrock_cfg = (_load_bedrock_cfg().get("bedrock") or {})
+                if not bool(_bedrock_cfg.get("use_prompt_caching", True)):
+                    return False, False
+            except Exception:
+                pass  # Config read failed — fall through to default-on behaviour
+            return True, True
+
         if is_native_anthropic:
             return True, True
         if is_openrouter and is_claude:

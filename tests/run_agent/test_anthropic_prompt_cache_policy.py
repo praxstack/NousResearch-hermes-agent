@@ -230,3 +230,69 @@ class TestExplicitOverrides:
             model="anthropic/claude-sonnet-4.6",
         )
         assert (should, native) == (True, False)
+
+
+class TestBedrockClaudeRespectsConfigToggle:
+    """Bedrock Claude path reads ``bedrock.use_prompt_caching`` before deciding.
+
+    Prior to this wiring the AnthropicBedrock path always cached regardless
+    of the wizard toggle, making the config a no-op. These tests pin the
+    three branches: default-on, explicitly-true, explicitly-false.
+    """
+
+    def _bedrock_claude_agent(self):
+        return _make_agent(
+            provider="bedrock",
+            base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            api_mode="anthropic_messages",
+            model="global.anthropic.claude-opus-4-7:1m",
+        )
+
+    def test_bedrock_claude_caches_by_default(self, monkeypatch):
+        # Config missing the key entirely → default True.
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"bedrock": {}},
+        )
+        agent = self._bedrock_claude_agent()
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_bedrock_claude_caches_when_explicitly_true(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"bedrock": {"use_prompt_caching": True}},
+        )
+        agent = self._bedrock_claude_agent()
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_bedrock_claude_skips_cache_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"bedrock": {"use_prompt_caching": False}},
+        )
+        agent = self._bedrock_claude_agent()
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_bedrock_claude_cache_survives_config_load_failure(self, monkeypatch):
+        # Config load raising → fall through to default-on behaviour,
+        # never raise up into the request loop.
+        def _boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+        agent = self._bedrock_claude_agent()
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_non_bedrock_claude_ignores_bedrock_config(self, monkeypatch):
+        # Non-bedrock Claude callers must NOT be gated on the bedrock toggle.
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"bedrock": {"use_prompt_caching": False}},
+        )
+        agent = _make_agent(
+            provider="anthropic",
+            base_url="https://api.anthropic.com",
+            api_mode="anthropic_messages",
+            model="claude-opus-4-7",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
