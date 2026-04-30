@@ -1258,6 +1258,12 @@ def resolve_runtime_provider(
                 return f"global.{base_id}{suffix}"
             # Regional prefix based on configured region
             region_lower = region.lower()
+            # GovCloud + China partitions do not support cross-region inference
+            # profiles (no `us-gov.` / `cn.` prefixes exist in AWS Bedrock).
+            # Return the bare model id so boto3 / the SDK dispatch to the
+            # partition's native endpoint without an invalid prefix.
+            if region_lower.startswith("us-gov-") or region_lower.startswith("cn-"):
+                return model_id
             if region_lower.startswith("us-"):
                 return f"us.{base_id}{suffix}"
             elif region_lower.startswith("eu-"):
