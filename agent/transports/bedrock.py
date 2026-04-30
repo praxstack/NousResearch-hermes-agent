@@ -99,10 +99,15 @@ class BedrockTransport(ProviderTransport):
         usage = None
         if hasattr(ns, "usage") and ns.usage:
             u = ns.usage
+            # Cache fields — populated by normalize_converse_response when
+            # cachePoint markers fired on the request. Zero when caching
+            # was not in play (matches Usage dataclass default).
             usage = Usage(
                 prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
                 completion_tokens=getattr(u, "completion_tokens", 0) or 0,
                 total_tokens=getattr(u, "total_tokens", 0) or 0,
+                cached_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
             )
 
         reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
@@ -146,6 +151,37 @@ class BedrockTransport(ProviderTransport):
             "content_filtered": "content_filter",
         }
         return _MAP.get(raw_reason, "stop")
+
+    def extract_cache_stats(self, response: Any) -> Optional[Dict[str, int]]:
+        """Extract Bedrock Converse cache-read / cache-write token counts.
+
+        Returns ``{"cached_tokens": N, "creation_tokens": N}`` when the
+        response reports cachePoint accounting (fields present AND
+        non-zero), otherwise ``None``. Matches the shape returned by
+        ``AnthropicTransport.extract_cache_stats`` so telemetry callers
+        can consume both transports uniformly.
+
+        Reads from both already-normalized SimpleNamespace responses
+        (post-normalize_converse_response) and raw boto3 dicts — the
+        dispatch site in run_agent.py:6217 normalizes before calling
+        this, so the SimpleNamespace path is the hot path.
+        """
+        # Normalized SimpleNamespace: usage has the snake_case aliases.
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            cached = getattr(usage, "cache_read_input_tokens", 0) or 0
+            written = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            if cached or written:
+                return {"cached_tokens": cached, "creation_tokens": written}
+            return None
+        # Raw boto3 dict: camelCase on response["usage"].
+        if isinstance(response, dict):
+            u = response.get("usage") or {}
+            cached = u.get("cacheReadInputTokens", 0) or 0
+            written = u.get("cacheWriteInputTokens", 0) or 0
+            if cached or written:
+                return {"cached_tokens": cached, "creation_tokens": written}
+        return None
 
 
 # Auto-register on import
