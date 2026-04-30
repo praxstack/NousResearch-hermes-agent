@@ -330,3 +330,45 @@ class TestExplicitOverrides:
 # Long-lived prefix cache policy (cross-session 1h tier)
 # ─────────────────────────────────────────────────────────────────────
 
+
+
+class TestBedrockClaudeRespectsConfigToggle:
+    """Bedrock Claude path reads ``bedrock.use_prompt_caching`` before deciding.
+
+    Prior to this wiring the AnthropicBedrock path always cached regardless
+    of the wizard toggle, making the config a no-op. These tests pin the
+    three branches: default-on, explicitly-true, explicitly-false.
+    """
+
+    def _bedrock_claude_agent(self):
+        return _make_agent(
+            provider="bedrock",
+            base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            api_mode="anthropic_messages",
+            model="global.anthropic.claude-opus-4-7:1m",
+        )
+
+    def test_bedrock_claude_caches_by_default(self, monkeypatch):
+        # Config missing the key entirely → default True.
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"bedrock": {}},
+        )
+        agent = self._bedrock_claude_agent()
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_bedrock_claude_caches_when_explicitly_true(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"bedrock": {"use_prompt_caching": True}},
+        )
+        agent = self._bedrock_claude_agent()
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_bedrock_claude_skips_cache_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"bedrock": {"use_prompt_caching": False}},
+        )
+        agent = self._bedrock_claude_agent()
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
