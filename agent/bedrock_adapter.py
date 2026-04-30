@@ -1006,12 +1006,38 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
 
     # Build usage stats
     usage_data = response.get("usage", {})
+    # Bedrock Converse returns prompt-cache fields in camelCase on
+    # ``usage.cacheReadInputTokens`` / ``usage.cacheWriteInputTokens``
+    # when the model supports cachePoint markers and caching fired.
+    # These are ONLY present in the response dict when caching ran —
+    # use .get(..., 0) to survive the no-cache case.
+    #
+    # AWS Bedrock semantics (verified against bedrock-runtime service-2.json
+    # and the User Guide "prompt caching" page):
+    #   - ``inputTokens`` represents the NEW/uncached input tokens billed
+    #     at the full rate; cache read/write tokens are reported SEPARATELY
+    #     and are NOT double-counted inside ``inputTokens``.
+    #   - This matches Anthropic native semantics. Pricing telemetry that
+    #     sums ``inputTokens + cacheReadInputTokens + cacheWriteInputTokens``
+    #     gives the true prompt size for cost reconciliation.
+    cache_read = usage_data.get("cacheReadInputTokens", 0) or 0
+    cache_write = usage_data.get("cacheWriteInputTokens", 0) or 0
     usage = SimpleNamespace(
         prompt_tokens=usage_data.get("inputTokens", 0),
         completion_tokens=usage_data.get("outputTokens", 0),
         total_tokens=(
             usage_data.get("inputTokens", 0) + usage_data.get("outputTokens", 0)
         ),
+        # Expose cache fields under BOTH the camelCase Bedrock names and the
+        # snake_case Anthropic-convention names so downstream normalizers can
+        # use whichever they already read. usage_pricing.py reads the
+        # Anthropic-convention names for the anthropic_messages branch; the
+        # Converse transport in agent/transports/bedrock.py reads the
+        # snake_case fields for the Usage dataclass.
+        cacheReadInputTokens=cache_read,
+        cacheWriteInputTokens=cache_write,
+        cache_read_input_tokens=cache_read,
+        cache_creation_input_tokens=cache_write,
     )
 
     finish_reason = _converse_stop_reason_to_openai(stop_reason)
