@@ -78,12 +78,19 @@ class ToolCall:
 
 @dataclass
 class Usage:
-    """Token usage from an API response."""
+    """Token usage from an API response.
+
+    Shared across all providers / transports. ``cached_tokens`` and
+    ``cache_creation_tokens`` represent prompt-cache hits vs writes
+    respectively — both populated when the upstream provider surfaces
+    them (Anthropic native, Bedrock Converse, OpenAI with cache_control).
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
     cached_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 @dataclass
