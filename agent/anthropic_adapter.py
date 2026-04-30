@@ -1419,6 +1419,84 @@ def _image_source_from_openai_url(url: str) -> Dict[str, str]:
     return {"type": "url", "url": url}
 
 
+def _document_source_from_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build an Anthropic document source dict from a content part.
+
+    Accepts several input shapes so Hermes callers don't have to produce
+    the exact Anthropic-native schema:
+
+    1. Native passthrough (already-correct Anthropic source):
+       {"type": "base64", "media_type": "application/pdf", "data": "..."}
+       {"type": "url",    "url": "https://example.com/doc.pdf"}
+       {"type": "text",   "media_type": "text/plain", "data": "..."}
+       {"type": "content","content": [...]}
+
+    2. OpenAI-style convenience:
+       part["document"] = "https://..."        → URL source
+       part["document"] = "data:application/pdf;base64,XXX" → base64 source
+       part["document_url"] = "https://..."    → URL source
+       part["document"] = {"url": "https://..."}
+       part["document"] = {"base64": "<b64>", "media_type": "application/pdf"}
+       part["document"] = {"file_path": "/tmp/doc.pdf"}  → reads+base64-encodes
+       part["document"] = {"text": "raw text", "media_type": "text/plain"}
+
+    Returns the ``source`` sub-dict ready to nest inside a
+    ``{"type": "document", "source": ...}`` Anthropic content block, or
+    ``None`` if the part doesn't contain a document reference.
+    """
+    # Passthrough: caller already built the source dict
+    src = part.get("source")
+    if isinstance(src, dict) and src.get("type") in {"base64", "url", "text", "content"}:
+        return dict(src)
+
+    # Shorthand: part["document"] or part["document_url"]
+    doc = part.get("document")
+    if doc is None:
+        doc = part.get("document_url")
+
+    if isinstance(doc, str):
+        doc_str = doc.strip()
+        if not doc_str:
+            return None
+        if doc_str.startswith("data:"):
+            header, _, data = doc_str.partition(",")
+            media_type = "application/pdf"
+            if header.startswith("data:"):
+                mime_part = header[len("data:"):].split(";", 1)[0].strip()
+                if mime_part:
+                    media_type = mime_part
+            return {"type": "base64", "media_type": media_type, "data": data}
+        # Treat as URL — covers http(s)://, file://, s3:// etc.
+        return {"type": "url", "url": doc_str}
+
+    if isinstance(doc, dict):
+        if "url" in doc:
+            return {"type": "url", "url": str(doc["url"])}
+        if "base64" in doc:
+            media_type = str(doc.get("media_type") or "application/pdf")
+            return {"type": "base64", "media_type": media_type, "data": str(doc["base64"])}
+        if "data" in doc and "media_type" in doc:
+            # Covers both base64 (application/pdf) and plain text (text/plain).
+            media_type = str(doc["media_type"])
+            block_type = "text" if media_type.startswith("text/") else "base64"
+            return {"type": block_type, "media_type": media_type, "data": str(doc["data"])}
+        if "text" in doc:
+            media_type = str(doc.get("media_type") or "text/plain")
+            return {"type": "text", "media_type": media_type, "data": str(doc["text"])}
+        if "file_path" in doc or "path" in doc:
+            # Read the file, base64-encode. Intentionally fail-loud on IO
+            # errors — silent dropping of a PDF attachment would be worse
+            # than a clear error message.
+            import base64
+            fp = str(doc.get("file_path") or doc.get("path"))
+            media_type = str(doc.get("media_type") or "application/pdf")
+            with open(fp, "rb") as _fh:
+                data = base64.standard_b64encode(_fh.read()).decode("ascii")
+            return {"type": "base64", "media_type": media_type, "data": data}
+
+    return None
+
+
 def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
     """Convert a single OpenAI-style content part to Anthropic format."""
     if part is None:
@@ -1436,6 +1514,27 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
         image_value = part.get("image_url", {})
         url = image_value.get("url", "") if isinstance(image_value, dict) else str(image_value or "")
         block = {"type": "image", "source": _image_source_from_openai_url(url)}
+    elif ptype == "document":
+        # Native Anthropic document block: keep source untouched when valid,
+        # otherwise reshape via _document_source_from_part.
+        src = _document_source_from_part(part)
+        block = {"type": "document"}
+        if src is not None:
+            block["source"] = src
+        # Preserve optional document metadata: title, context, citations.
+        for optional in ("title", "context", "citations"):
+            if optional in part and part[optional] is not None:
+                block[optional] = part[optional]
+    elif ptype in {"input_file", "document_url", "file", "pdf"}:
+        # Convenience aliases for attaching PDFs/documents. Map to a
+        # standard Anthropic document block.
+        src = _document_source_from_part(part)
+        if src is None:
+            return None
+        block = {"type": "document", "source": src}
+        for optional in ("title", "context", "citations"):
+            if optional in part and part[optional] is not None:
+                block[optional] = part[optional]
     else:
         block = dict(part)
 
