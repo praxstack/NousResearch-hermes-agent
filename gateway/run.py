@@ -2613,6 +2613,24 @@ class GatewayRunner:
                     platform_str, chat_id, e,
                 )
 
+        # Home-channel shutdown notifications are noisy when the gateway
+        # restarts for any reason (watchdog kick, manual restart, clean
+        # exit) and there were no active agent sessions to interrupt. An
+        # idle gateway restarting is not user-visible behaviour — don't
+        # surface it unless an active session actually got cut off, OR the
+        # operator has explicitly opted into "always notify" (legacy
+        # behaviour) via HERMES_GATEWAY_ALWAYS_NOTIFY_HOME_ON_SHUTDOWN=1.
+        always_notify_home = os.environ.get(
+            "HERMES_GATEWAY_ALWAYS_NOTIFY_HOME_ON_SHUTDOWN", ""
+        ).lower() in ("1", "true", "yes")
+        if not active and not always_notify_home:
+            logger.debug(
+                "Skipping home-channel shutdown notification: no active "
+                "sessions to interrupt (set HERMES_GATEWAY_ALWAYS_NOTIFY_"
+                "HOME_ON_SHUTDOWN=1 to restore legacy behaviour)."
+            )
+            return
+
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
@@ -14794,6 +14812,12 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    # HEARTBEAT_EVERY: emit a log line every N ticks so external health
+    # checks (launchd watchdog, monit, systemd) can distinguish a healthy
+    # idle gateway from a wedged one. Without this, a gateway with no
+    # incoming traffic looks identical to a hung one — any stale-log
+    # heuristic produces false positives.
+    HEARTBEAT_EVERY = 5      # ticks — every 5 minutes at default 60s interval
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
@@ -14859,6 +14883,20 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 )
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
+
+        # Heartbeat: emit an INFO line every HEARTBEAT_EVERY ticks so stale-
+        # log health checks (launchd watchdog etc.) can distinguish healthy
+        # idle gateways from wedged ones. The count surfaced here is not
+        # load-bearing; the *presence* of the log line is what matters.
+        if tick_count % HEARTBEAT_EVERY == 0:
+            try:
+                adapter_count = len(adapters) if adapters else 0
+                logger.info(
+                    "Gateway heartbeat: tick=%d adapters=%d interval=%ds",
+                    tick_count, adapter_count, interval,
+                )
+            except Exception as e:
+                logger.debug("Heartbeat emit error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")
