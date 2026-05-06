@@ -70,3 +70,8 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+
+# openmemory MCP server sqlite cache (runtime artifact, not source)
+openmemory.db
+openmemory.db-shm
+openmemory.db-wal
