@@ -271,10 +271,14 @@ _CLAUDE_1M_CAPABLE_BASE_IDS = (
     "anthropic.claude-opus-4-6-v1",
     "anthropic.claude-opus-4-6",
     "anthropic.claude-sonnet-4-6",
-    # Parity with Cline `JP_SUPPORTED_CRIS_MODELS` (bedrock.ts ~line 139):
-    # Sonnet 4.5 with the 1M variant is first-class in upstream.
+    # Parity with Cline `JP_SUPPORTED_CRIS_MODELS` (bedrock.ts ~line 139)
+    # and Cline's src/shared/api.ts bedrock model list (~line 515+):
+    # Sonnet 4.5 (Sep 2025 release) + Sonnet 4.0 (May 2025 release) both
+    # expose first-class :1m variants upstream.
     "anthropic.claude-sonnet-4-5-20250929",
     "anthropic.claude-sonnet-4-5",
+    "anthropic.claude-sonnet-4-20250514",
+    "anthropic.claude-sonnet-4",
 )
 
 
@@ -1672,6 +1676,11 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # caller passes the full date/version-qualified model id.
     "anthropic.claude-sonnet-4-5-20250929-v1:0:1m": 1_000_000,
     "anthropic.claude-sonnet-4-5-20250929-v1:0":    200_000,
+    # Sonnet 4.0 (May 2025 release) — Cline's bedrock catalog
+    # (src/shared/api.ts ~line 591) exposes the :1m variant for this
+    # model too. Include both base + :1m entries.
+    "anthropic.claude-sonnet-4-20250514-v1:0:1m":   1_000_000,
+    "anthropic.claude-sonnet-4-20250514-v1:0":      200_000,
     # Amazon Nova
     "amazon.nova-pro":               300_000,
     "amazon.nova-lite":              300_000,
