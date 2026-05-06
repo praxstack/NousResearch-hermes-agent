@@ -188,16 +188,22 @@ def get_subprocess_home() -> str | None:
     return None
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh".
+    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max".
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none".
     Returns {"enabled": True, "effort": <level>} for valid effort levels.
+
+    Note on "max": Anthropic's adaptive-thinking API exposes 5 levels on 4.7+
+    (low, medium, high, xhigh, max). "max" is the highest. The CLI accepts
+    and forwards it; downstream adapters (anthropic_adapter.ADAPTIVE_EFFORT_MAP)
+    route it straight through on 4.7+ and downgrade to "max" on 4.6 (which
+    is also 4.6's ceiling). Keep this list in sync with the adapter's map.
     """
     if not effort or not effort.strip():
         return None
