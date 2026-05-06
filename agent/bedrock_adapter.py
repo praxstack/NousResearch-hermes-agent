@@ -221,6 +221,14 @@ def is_stale_connection_error(exc: BaseException) -> bool:
             if any(module.startswith(prefix) for prefix in _STALE_LIB_MODULE_PREFIXES):
                 return True
 
+    # Anthropic SDK streaming: "Unexpected event order, got <type> before
+    # message_start" — Bedrock occasionally returns a service/throttle error as
+    # the very first streaming event instead of message_start. The SDK surfaces
+    # this as a RuntimeError. Treat it as a stale/transient connection so hermes
+    # fast-fails to the fallback model instead of retrying 3 times.
+    if isinstance(exc, RuntimeError) and "before \"message_start\"" in str(exc):
+        return True
+
     return False
 
 
