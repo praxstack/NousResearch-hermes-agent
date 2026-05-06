@@ -804,6 +804,12 @@ def parse_reasoning_effort(effort) -> dict | None:
     in config.yaml and YAML hands us a bool, which must mean disabled, not
     "fall back to the default and keep thinking").
     Returns {"enabled": True, "effort": <level>} for valid effort levels.
+
+    Note on "max": Anthropic's adaptive-thinking API exposes 5 levels on 4.7+
+    (low, medium, high, xhigh, max). "max" is the highest. The CLI accepts
+    and forwards it; downstream adapters (anthropic_adapter.ADAPTIVE_EFFORT_MAP)
+    route it straight through on 4.7+ and downgrade to "max" on 4.6 (which
+    is also 4.6's ceiling). Keep this list in sync with the adapter's map.
     """
     if effort is False:
         return {"enabled": False}
