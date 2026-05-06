@@ -40,6 +40,22 @@ def test_bedrock_api_key_flow_saves_native_bedrock_provider(monkeypatch):
     # Default (empty) → accept the default value (True for all three).
     monkeypatch.setattr("builtins.input", lambda _prompt="": "")
 
+    # The auth-flow calls _discover_bedrock_model_list which ultimately calls
+    # discover_bedrock_models(region, config=config_preview) on the real boto3
+    # client. That requires a live AWS_BEARER_TOKEN_BEDROCK in os.environ,
+    # which the test harness doesn't set. Short-circuit by returning a
+    # fabricated model list — the point of this test is the config-save
+    # flow, not live AWS discovery.
+    import agent.bedrock_adapter as bedrock_mod
+    monkeypatch.setattr(
+        bedrock_mod,
+        "discover_bedrock_models",
+        lambda region, config=None: [
+            {"id": "anthropic.claude-sonnet-4-20250514-v1:0"},
+            {"id": "anthropic.claude-opus-4-7"},
+        ],
+    )
+
     main_mod._model_flow_bedrock_api_key({}, "us-east-1")
 
     assert saved_cfg["model"]["provider"] == "bedrock"
