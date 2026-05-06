@@ -44,18 +44,31 @@ def _get_anthropic_sdk():
 
 logger = logging.getLogger(__name__)
 
-THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+THINKING_BUDGET = {"max": 32000, "xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
+#
 # Anthropic exposes 5 levels on 4.7+: low, medium, high, xhigh, max.
 # Opus/Sonnet 4.6 only expose 4 levels: low, medium, high, max — no xhigh.
-# We preserve xhigh as xhigh on 4.7+ (the recommended default for coding/
-# agentic work) and downgrade it to max on pre-4.7 adaptive models (which
-# is the strongest level they accept).  "minimal" is a legacy alias that
-# maps to low on every model.  See:
+# "max" is the single highest level on every adaptive-thinking model, so
+# Hermes sends it straight through. On 4.6 the existing downgrade below
+# already rewrites xhigh → max for callers that pick "xhigh".
+#
+# Prax preference (2026-05-06): cost is a non-issue; always route user intent
+# to the highest Anthropic-accepted reasoning level. That means "max" stays
+# "max", "xhigh" stays "xhigh" on 4.7+ (downgrades to max on 4.6), and the
+# THINKING_BUDGET table above has a first-class "max" entry so pre-4.6
+# manual-thinking paths don't silently fall back to 8000 tokens.
+#
+# Cline (as of 2026-04-27) exposes only up to "xhigh" in its user-facing
+# OPENAI_REASONING_EFFORT_OPTIONS list. We deliberately keep "max" on the
+# hermes side — the API still accepts it, and the fork policy is
+# "highest-possible-by-default", not Cline parity on this knob.
+#
+# "minimal" is a legacy alias that maps to low on every model. See:
 # https://platform.claude.com/docs/en/about-claude/models/migration-guide
 ADAPTIVE_EFFORT_MAP = {
-    "max":     "max",
-    "xhigh":   "xhigh",
+    "max":     "max",      # highest on both 4.6 and 4.7 — keep as-is.
+    "xhigh":   "xhigh",    # highest on 4.7; downgrade to max on 4.6 below.
     "high":    "high",
     "medium":  "medium",
     "low":     "low",
