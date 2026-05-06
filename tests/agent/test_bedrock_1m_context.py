@@ -61,3 +61,36 @@ class TestBedrockContext1MBeta:
         # Other common betas still present — no regression.
         assert "interleaved-thinking-2025-05-14" in beta_header
         assert "fine-grained-tool-streaming-2025-05-14" in beta_header
+
+    def test_build_anthropic_kwargs_includes_1m_for_bedrock_fastmode(self):
+        """Fast-mode requests (per-request extra_headers) still include 1M beta.
+
+        Per-request extra_headers override client-level default_headers, so
+        the fast-mode path must re-include everything in _COMMON_BETAS.
+
+        Uses claude-opus-4-6 because it's the only model that actually
+        triggers the fast-mode code path (see _FAST_MODE_SUPPORTED_SUBSTRINGS
+        in agent/anthropic_adapter.py — Cline only exposes :fast on 4.6).
+        On models where fast-mode is a no-op (e.g. opus-4-7), extra_headers
+        stays None and the default_headers path applies normally, which is
+        correct behavior — the "override" concern only applies when
+        extra_headers is actually being set.
+        """
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-6",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            max_tokens=1024,
+            reasoning_config=None,
+            is_oauth=False,
+            # Empty base_url mirrors AnthropicBedrock (no HTTP base URL)
+            base_url=None,
+            fast_mode=True,
+        )
+        beta_header = kwargs.get("extra_headers", {}).get("anthropic-beta", "")
+        assert "context-1m-2025-08-07" in beta_header, (
+            "fast-mode extra_headers must carry the 1M beta or it overrides "
+            "client-level default_headers and Bedrock drops back to 200K"
+        )
