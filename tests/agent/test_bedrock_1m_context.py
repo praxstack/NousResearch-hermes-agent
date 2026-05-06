@@ -84,11 +84,19 @@ class TestBedrockContext1MBeta:
 
         Per-request extra_headers override client-level default_headers, so
         the fast-mode path must re-include everything in _COMMON_BETAS.
+
+        Uses claude-opus-4-6 because it's the only model that actually
+        triggers the fast-mode code path (see _FAST_MODE_SUPPORTED_SUBSTRINGS
+        in agent/anthropic_adapter.py — Cline only exposes :fast on 4.6).
+        On models where fast-mode is a no-op (e.g. opus-4-7), extra_headers
+        stays None and the default_headers path applies normally, which is
+        correct behavior — the "override" concern only applies when
+        extra_headers is actually being set.
         """
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-7",
+            model="claude-opus-4-6",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,
             max_tokens=1024,
