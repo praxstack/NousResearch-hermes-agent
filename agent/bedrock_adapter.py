@@ -1665,6 +1665,13 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     "anthropic.claude-opus-4-6-v1:1m":    1_000_000,
     "anthropic.claude-sonnet-4-6:1m":     1_000_000,
     "anthropic.claude-sonnet-4-5:1m":     1_000_000,
+    # Date-stamped + version-qualified variants — Cline's canonical
+    # wire form (see JP_SUPPORTED_CRIS_MODELS in bedrock.ts). Substring
+    # matching picks the longest key, so these more-specific IDs win
+    # over the bare "anthropic.claude-sonnet-4-5" 200K entry when the
+    # caller passes the full date/version-qualified model id.
+    "anthropic.claude-sonnet-4-5-20250929-v1:0:1m": 1_000_000,
+    "anthropic.claude-sonnet-4-5-20250929-v1:0":    200_000,
     # Amazon Nova
     "amazon.nova-pro":               300_000,
     "amazon.nova-lite":              300_000,
