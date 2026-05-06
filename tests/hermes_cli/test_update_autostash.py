@@ -615,3 +615,142 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
     out = capsys.readouterr().out
     assert "preserved in stash" in out
+
+
+# ----------------------------------------------------------------------------
+# Regression tests for the "update leaves HEAD on main" bug
+# ----------------------------------------------------------------------------
+# Fixed 2026-05-06. Before the fix, `hermes update` on a feature branch:
+#   1. Stashed local changes
+#   2. Checked out main
+#   3. Pulled
+#   4. Restored the stash (on main — WRONG)
+#   5. Returned without checking out the feature branch (also WRONG)
+#
+# Fix: switch back to original branch BEFORE restoring the stash, in BOTH
+# the "already up to date" and "successful update" finally blocks.
+
+
+def test_cmd_update_restores_feature_branch_after_successful_update(
+    monkeypatch, tmp_path, capsys
+):
+    """After a successful pull, HEAD must land back on the feature branch."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="feat/my-work", commit_count="3",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    # A checkout back to the feature branch must have happened.
+    checkout_back = [
+        c for c in recorded
+        if "checkout" in c and "feat/my-work" in c
+    ]
+    assert len(checkout_back) == 1, (
+        "hermes update must switch back to feat/my-work after pulling main "
+        "(prior to 2026-05-06 fix, HEAD was silently left on main)"
+    )
+
+
+def test_cmd_update_checkout_back_happens_before_stash_restore(
+    monkeypatch, tmp_path
+):
+    """Order of operations in finally: checkout-back MUST precede stash restore.
+
+    If stash is restored BEFORE switching back to the feature branch, the
+    stashed feature-branch edits get applied on top of main — which is the
+    original silent-corruption bug. Guarantee the ordering explicitly.
+    """
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+
+    # Ensure the stash path actually runs
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed",
+        lambda *a, **kw: "abc123deadbeef",
+    )
+
+    restore_called_at = []
+    recorded_before_restore = []
+
+    def fake_restore(*a, **kw):
+        # Snapshot the subprocess call history at the moment restore runs.
+        # This lets us assert the checkout-back ran first.
+        restore_called_at.append(len(recorded))
+        recorded_before_restore.extend(list(recorded))
+        return True
+
+    monkeypatch.setattr(
+        hermes_main, "_restore_stashed_changes", fake_restore,
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="feat/my-work", commit_count="3",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    # Stash restore must have run exactly once.
+    assert len(restore_called_at) == 1
+
+    # At the moment stash restore ran, the checkout-back call must
+    # already have been recorded. This is the ordering invariant.
+    checkout_back_indices = [
+        i for i, c in enumerate(recorded_before_restore)
+        if "checkout" in c and "feat/my-work" in c
+    ]
+    assert len(checkout_back_indices) >= 1, (
+        "checkout feat/my-work must run BEFORE _restore_stashed_changes "
+        "in the finally block — otherwise stashed feature-branch edits "
+        "get applied to main"
+    )
+
+
+def test_cmd_update_already_up_to_date_checkout_back_before_restore(
+    monkeypatch, tmp_path
+):
+    """Same ordering invariant for the 'already up to date' path."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed",
+        lambda *a, **kw: "stashref",
+    )
+
+    recorded_before_restore = []
+
+    def fake_restore(*a, **kw):
+        recorded_before_restore.extend(list(recorded))
+        return True
+
+    monkeypatch.setattr(
+        hermes_main, "_restore_stashed_changes", fake_restore,
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="feat/my-work", commit_count="0",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    checkout_back = [
+        c for c in recorded_before_restore
+        if "checkout" in c and "feat/my-work" in c
+    ]
+    assert len(checkout_back) >= 1, (
+        "In the 'already up to date' path, checkout feat/my-work must "
+        "happen BEFORE _restore_stashed_changes"
+    )

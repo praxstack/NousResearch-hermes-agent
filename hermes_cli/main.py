@@ -7095,15 +7095,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         if commit_count == 0:
             _invalidate_update_cache()
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
+            # Switch back to original branch BEFORE restoring the stash,
+            # so stashed edits land on the user's branch, not on main.
+            # (Prior to 2026-05-06 fix, this block restored the stash first
+            # which applied feature-branch edits to main — silently broken.)
             if current_branch not in ("main", "HEAD"):
                 subprocess.run(
                     git_cmd + ["checkout", current_branch],
@@ -7111,6 +7106,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     capture_output=True,
                     text=True,
                     check=False,
+                )
+            # Restore stash on the correct branch now that we're back
+            if auto_stash_ref is not None:
+                _restore_stashed_changes(
+                    git_cmd,
+                    PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=prompt_for_restore,
+                    input_fn=gw_input_fn,
                 )
             print("✓ Already up to date!")
             return
@@ -7165,6 +7169,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     sys.exit(1)
             update_succeeded = True
         finally:
+            # Switch back to the user's original branch BEFORE restoring the
+            # stash, so stashed edits land on the user's branch, not on main.
+            # Without this, successful `hermes update` silently left HEAD on
+            # main and (if anything was stashed) applied the user's
+            # branch-local edits to main. Affects any fork / feature-branch
+            # workflow (e.g. our bedrock parity branch, or downstream forks
+            # developing against main).
+            # Fixed 2026-05-06 — reproduced in reflog:
+            #   checkout: feat → main → pull ff-only → HEAD left on main
+            # The "already up to date" path above was fixed in the same
+            # commit to match this ordering.
+            if current_branch not in ("main", "HEAD"):
+                back = subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if back.returncode != 0:
+                    print(
+                        f"  ⚠ Could not switch back to '{current_branch}': "
+                        f"{(back.stderr or '').strip()}"
+                    )
+                    print("    HEAD is on 'main' with updated code. Run:")
+                    print(f"    git -C {PROJECT_ROOT} checkout {current_branch}")
             if auto_stash_ref is not None:
                 # Don't attempt stash restore if the code update itself failed —
                 # working tree is in an unknown state.
