@@ -271,21 +271,42 @@ _CLAUDE_1M_CAPABLE_BASE_IDS = (
     "anthropic.claude-opus-4-6-v1",
     "anthropic.claude-opus-4-6",
     "anthropic.claude-sonnet-4-6",
+    # Parity with Cline `JP_SUPPORTED_CRIS_MODELS` (bedrock.ts ~line 139):
+    # Sonnet 4.5 with the 1M variant is first-class in upstream.
+    "anthropic.claude-sonnet-4-5-20250929",
+    "anthropic.claude-sonnet-4-5",
 )
 
 
 def split_bedrock_1m_suffix(model_id: str) -> tuple:
     """Split ``model_id`` into ``(base_model_id, enable_1m_context)``.
 
-    Accepts both the raw suffix form (``anthropic.claude-opus-4-7:1m``) and
-    the regional-prefix form (``us.anthropic.claude-opus-4-7:1m``).  Returns
-    the base ID (minus ``:1m``) and a bool indicating whether the 1M beta
-    header should be attached to the request.
+    Accepts:
+      * raw suffix form: ``anthropic.claude-opus-4-7:1m``
+      * regional-prefix form: ``us.anthropic.claude-opus-4-7:1m``
+      * combined Cline-style suffix: ``anthropic.claude-opus-4-6:1m:fast``
+
+    Cline exposes ``:fast`` as an Anthropic-native fast-mode opt-in that can
+    stack with ``:1m`` (see cline ``src/shared/api.ts`` — the
+    ``claude-opus-4-6:1m:fast`` entry). On the Bedrock Converse wire, fast
+    mode doesn't apply — it's an Anthropic-endpoint feature handled inside
+    ``anthropic_adapter.py`` — so we strip ``:fast`` silently here and only
+    return the 1M-context flag. The fast-mode path has its own suffix
+    handling on the AnthropicBedrock SDK code path.
+
+    Returns the base ID (minus any recognised suffixes) and a bool
+    indicating whether the 1M beta header should be attached to the request.
     """
     if not isinstance(model_id, str):
         return model_id, False
-    if model_id.endswith(CLAUDE_1M_SUFFIX):
-        return model_id[: -len(CLAUDE_1M_SUFFIX)], True
+    working = model_id
+    # Strip :fast first so `:1m:fast` resolves cleanly.
+    _FAST_SUFFIX = ":fast"
+    if working.endswith(_FAST_SUFFIX):
+        working = working[: -len(_FAST_SUFFIX)]
+    if working.endswith(CLAUDE_1M_SUFFIX):
+        return working[: -len(CLAUDE_1M_SUFFIX)], True
+    # Nothing stripped → return the original id unchanged.
     return model_id, False
 
 
