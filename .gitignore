@@ -75,3 +75,8 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# openmemory MCP server sqlite cache (runtime artifact, not source)
+openmemory.db
+openmemory.db-shm
+openmemory.db-wal
