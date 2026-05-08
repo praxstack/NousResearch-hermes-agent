@@ -9604,7 +9604,7 @@ class AIAgent:
                 model=self.model,
                 messages=api_messages,
                 tools=tools_for_api,
-                max_tokens=self.max_tokens or 4096,
+                max_tokens=self.max_tokens or 64000,
                 region=region,
                 guardrail_config=guardrail,
             )
