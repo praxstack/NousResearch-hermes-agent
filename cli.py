@@ -2342,9 +2342,12 @@ class HermesCLI:
         try:
             renderer = app.renderer
             out = renderer.output
+            # Scrollback-safe viewport clear: \x1b[H\x1b[J (home +
+            # erase-below) rather than \x1b[2J. Ctrl+L / /redraw should
+            # repaint the viewport without nuking terminal scrollback.
             out.reset_attributes()
-            out.erase_screen()
             out.cursor_goto(0, 0)
+            out.erase_down()
             out.flush()
             # Drop prompt_toolkit's cached screen + cursor state so the
             # next _redraw() starts from a known (0, 0) origin and
@@ -2437,10 +2440,28 @@ class HermesCLI:
         if len(model_short) > 26:
             model_short = f"{model_short[:23]}..."
 
+        # ── Region tag for Bedrock (Prax custom, 2026-05-07) ──
+        # Extract "bedrock-runtime.eu-north-1.amazonaws.com" → "eu-n1"
+        # so the TUI shows WHICH region is active. Critical when fallback
+        # rotates through multiple regions.
+        region_tag = ""
+        _base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None) or ""
+        if "bedrock-runtime." in _base_url:
+            import re as _re
+            _m = _re.search(r"bedrock-runtime\.([a-z0-9-]+)\.amazonaws", _base_url)
+            if _m:
+                _parts = _m.group(1).split("-")
+                if len(_parts) == 3:
+                    # "eu-north-1" → "eu-n1"; "us-east-1" → "us-e1"
+                    region_tag = f"{_parts[0]}-{_parts[1][0]}{_parts[2]}"
+                else:
+                    region_tag = _m.group(1)
+
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "region_tag": region_tag,
             "duration": format_duration_compact(elapsed_seconds),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
@@ -2660,6 +2681,7 @@ class HermesCLI:
                 text = f"⚕ {snapshot['model_short']} · {duration_label}"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
+                # Region tag dropped in compact mode to save chars
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
@@ -2671,7 +2693,12 @@ class HermesCLI:
             else:
                 context_label = "ctx --"
 
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            # Region tag inserted after model_short (Prax custom 2026-05-07)
+            _region = snapshot.get("region_tag") or ""
+            _model_with_region = f"⚕ {snapshot['model_short']}"
+            if _region:
+                _model_with_region = f"⚕ {snapshot['model_short']} · {_region}"
+            parts = [_model_with_region, context_label, percent_label]
             parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
@@ -2723,9 +2750,18 @@ class HermesCLI:
                         context_label = "ctx --"
 
                     bar_style = self._status_bar_context_style(percent)
+                    # Region tag inserted after model_short (Prax custom 2026-05-07)
+                    _region_frags = []
+                    _region = snapshot.get("region_tag") or ""
+                    if _region:
+                        _region_frags = [
+                            ("class:status-bar-dim", " · "),
+                            ("class:status-bar-dim", _region),
+                        ]
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                        *_region_frags,
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
@@ -11663,9 +11699,13 @@ class HermesCLI:
                 # Reset attributes, erase the entire screen, and home the
                 # cursor. This overwrites any reflowed status-bar rows or
                 # stale content the terminal kept from the prior layout.
+                # Scrollback-safe: \x1b[H\x1b[J instead of \x1b[2J.
+                # Multiplexers (cmux, tmux) treat \x1b[2J from a child PTY
+                # as "dump this pane's scrollback" — \x1b[J is viewport-
+                # only. Survives spurious SIGWINCHes on cmux tab-switches.
                 out.reset_attributes()
-                out.erase_screen()
                 out.cursor_goto(0, 0)
+                out.erase_down()
                 out.flush()
                 # Tell the renderer its tracked position is fresh so its
                 # own erase() inside _on_resize doesn't cursor_up() past

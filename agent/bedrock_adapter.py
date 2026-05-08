@@ -47,6 +47,45 @@ _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
 
 
+# ---------------------------------------------------------------------------
+# BEDROCK_BOTO_CONFIG — Prax custom patch 2026-05-08 (read_timeout fix)
+# ---------------------------------------------------------------------------
+# Root cause of "Unexpected event order, got error before message_start":
+#   AWS Bedrock servers have a 60-MINUTE inference timeout for Claude 4 / 3.7
+#   Sonnet models (per official docs). boto3's default read_timeout is 60s.
+#   When Opus 4.7 does deep adaptive thinking on 1M-context inputs, the total
+#   wall-clock exceeds 60s before first token, boto3 closes the TCP connection,
+#   and the SDK surfaces "Unexpected event order" because it got partial bytes.
+#
+# Fix: set read_timeout=3600 (60 minutes, matching server) + connect_timeout=60
+# (tight upper bound on initial DNS+TCP+TLS handshake). Retries disabled at
+# this layer because hermes-agent's higher-level retry/fallback is smarter
+# about routing to alternate regions / CRIs.
+#
+# Reference:
+#   https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html
+#   (search: "60 minutes")
+# ---------------------------------------------------------------------------
+def _bedrock_boto_config():
+    """Lazily create a botocore Config with Bedrock-safe timeouts.
+
+    Returns None if botocore isn't importable (shouldn't happen if boto3 is
+    installed, but fail-open so we don't break existing behaviour).
+    """
+    try:
+        from botocore.config import Config
+    except ImportError:
+        return None
+    # tcp_keepalive=True keeps the connection healthy across macOS sleep/wake
+    # cycles, which matters when a long thinking call straddles a lid-close.
+    return Config(
+        read_timeout=3600,       # 1 hour — matches Bedrock server-side timeout
+        connect_timeout=60,      # generous DNS+TCP+TLS handshake window
+        retries={"max_attempts": 0},  # disable boto-level retries; hermes layer handles fallback
+        tcp_keepalive=True,
+    )
+
+
 def _require_boto3():
     """Import boto3, raising a clear error if not installed."""
     try:
@@ -269,6 +308,41 @@ BEDROCK_INFERENCE_PROFILE_PREFIXES = (
 # ~2x on input over 200K) without accidentally paying the premium.
 CLAUDE_1M_SUFFIX = ":1m"
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
+# ── Maxed-out Bedrock beta set (Prax custom, 2026-05-07) ──
+# Live-tested against Bedrock Opus 4.7 in us-east-1. These 7 betas are
+# ACCEPTED. The 12 others I tested (extended-cache-ttl, citations,
+# code-execution, files-api, token-efficient-tool-use, etc.) are rejected
+# by Bedrock with "invalid beta flag". Keep this list in sync with the
+# post-update-patches handler's integrity marker.
+_MAXED_BEDROCK_BETAS = [
+    "context-1m-2025-08-07",                   # 1M ctx
+    "interleaved-thinking-2025-05-14",         # think between tool calls
+    "fine-grained-tool-streaming-2025-05-14",  # granular tool-arg streaming
+    "output-128k-2025-02-19",                  # up to 128k output tokens
+    "pdfs-2024-09-25",                         # native PDF input
+    "web-search-2025-03-05",                   # Anthropic web-search server tool
+    "computer-use-2025-01-24",                 # computer-use server tool
+]
+
+def _is_claude_4_7_or_later(wire_model: str) -> bool:
+    """True if wire_model is Claude Opus 4.7+ (accepts adaptive thinking schema).
+
+    Opus 4.6 and earlier reject `thinking.type=adaptive` — use enabled+budget
+    there. Conservative match: only triggers on the exact 4.7 ID we know works.
+    """
+    if not wire_model:
+        return False
+    # Strip region / CRI prefix
+    m = wire_model.split(".")[-1].lower() if "." in wire_model else wire_model.lower()
+    # Match: claude-opus-4-7, future claude-opus-5-*, claude-sonnet-5-*, etc.
+    return (
+        "claude-opus-4-7" in m
+        or "claude-opus-5" in m
+        or "claude-sonnet-5" in m
+        or "claude-opus-4-8" in m
+        or "claude-opus-4-9" in m
+    )
 
 # Base Claude model IDs that support the 1M context variant on Bedrock.
 # Includes the foundation-model IDs; regional/global inference-profile
@@ -663,6 +737,12 @@ def _create_bedrock_client(service: str, region: str, auth_config: Dict[str, str
     extra_kwargs: Dict[str, Any] = {}
     if endpoint_url:
         extra_kwargs["endpoint_url"] = endpoint_url
+
+    # Inject Bedrock-safe boto timeouts (Prax 2026-05-08, read_timeout=3600).
+    # See _bedrock_boto_config() for rationale.
+    _boto_cfg = _bedrock_boto_config()
+    if _boto_cfg is not None:
+        extra_kwargs.setdefault("config", _boto_cfg)
 
     if method == "api_key":
         with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY):
@@ -1261,7 +1341,7 @@ def build_converse_kwargs(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 64000,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -1328,6 +1408,24 @@ def build_converse_kwargs(
             betas.append(CONTEXT_1M_BETA)
         kwargs["additionalModelRequestFields"]["anthropic_beta"] = betas
 
+    # ── Maxed-out betas + adaptive thinking (Prax 2026-05-07) ──
+    # Live-tested on Bedrock us-east-1; 7 betas pass, 12 reject.
+    # Guard: Opus 4.7+ is the only family that accepts `thinking.type=adaptive`
+    # with `output_config.effort=max`. Opus 4.6 rejects this schema.
+    if _is_claude_4_7_or_later(wire_model):
+        kwargs.setdefault("additionalModelRequestFields", {})
+        add = kwargs["additionalModelRequestFields"]
+        betas = list(add.get("anthropic_beta") or [])
+        for beta in _MAXED_BEDROCK_BETAS:
+            if beta not in betas:
+                betas.append(beta)
+        add["anthropic_beta"] = betas
+        # Adaptive thinking — rejected if already set (caller override wins)
+        if "thinking" not in add:
+            add["thinking"] = {"type": "adaptive"}
+        if "output_config" not in add:
+            add["output_config"] = {"effort": "max"}
+
     if guardrail_config:
         kwargs["guardrailConfig"] = guardrail_config
 
@@ -1339,7 +1437,7 @@ def call_converse(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 64000,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -1380,7 +1478,7 @@ def call_converse_stream(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 64000,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
