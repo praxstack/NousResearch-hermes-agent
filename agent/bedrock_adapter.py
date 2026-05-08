@@ -283,6 +283,98 @@ BEDROCK_INFERENCE_PROFILE_PREFIXES = (
 CLAUDE_1M_SUFFIX = ":1m"
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
+# ── Maxed-out Bedrock beta set (Prax custom, 2026-05-07) ──
+# Live-tested against Bedrock Opus 4.7 in us-east-1. These 7 betas are
+# ACCEPTED. The 12 others I tested (extended-cache-ttl, citations,
+# code-execution, files-api, token-efficient-tool-use, etc.) are rejected
+# by Bedrock with "invalid beta flag". Keep this list in sync with the
+# post-update-patches handler's integrity marker.
+_MAXED_BEDROCK_BETAS = [
+    "context-1m-2025-08-07",                   # 1M ctx
+    "interleaved-thinking-2025-05-14",         # think between tool calls
+    "fine-grained-tool-streaming-2025-05-14",  # granular tool-arg streaming
+    "output-128k-2025-02-19",                  # up to 128k output tokens
+    "pdfs-2024-09-25",                         # native PDF input
+    "web-search-2025-03-05",                   # Anthropic web-search server tool
+    "computer-use-2025-01-24",                 # computer-use server tool
+]
+
+def _is_claude_4_7_or_later(wire_model: str) -> bool:
+    """True if wire_model is Claude Opus 4.7+ (accepts adaptive thinking schema).
+
+    Opus 4.6 and earlier reject `thinking.type=adaptive` — use enabled+budget
+    there. Conservative match: only triggers on the exact 4.7 ID we know works.
+    """
+    if not wire_model:
+        return False
+    # Strip region / CRI prefix
+    m = wire_model.split(".")[-1].lower() if "." in wire_model else wire_model.lower()
+    # Match: claude-opus-4-7, future claude-opus-5-*, claude-sonnet-5-*, etc.
+    return (
+        "claude-opus-4-7" in m
+        or "claude-opus-5" in m
+        or "claude-sonnet-5" in m
+        or "claude-opus-4-8" in m
+        or "claude-opus-4-9" in m
+    )
+
+# ---------------------------------------------------------------------------
+# Sampling-parameter deprecations — Prax custom patch 2026-05-08
+# ---------------------------------------------------------------------------
+# Empirical matrix (live Bedrock calls across 4 regions × 6 payloads):
+#   Opus 4.7  (us/eu/jp/au):  temperature and top_p BOTH rejected with
+#                             "temperature is deprecated for this model" / same for top_p.
+#                             temperature=1.0 is accepted because 1.0 is the default
+#                             and Bedrock treats it as "not set" — but we can't
+#                             distinguish caller-set-1.0 from default, so safest is
+#                             to drop the key entirely.
+#   Opus 4.6  (any region):   temperature OR top_p alone OK. BOTH together rejected:
+#                             "temperature and top_p cannot both be set".
+#   Sonnet 4.6 (any region):  same as Opus 4.6.
+#
+# Region is irrelevant — these are model contracts, not regional endpoints.
+# Fix is two guards:
+#   (1) _bedrock_forbids_sampling_params() drops temperature/top_p/top_k entirely
+#       for Opus 4.7 and future 4.7+ models.
+#   (2) _bedrock_forbids_temp_and_top_p_together() drops whichever was
+#       passed LAST (top_p preferred-dropped since temperature is more commonly
+#       set and the Anthropic adapter keeps temperature) for Opus 4.6 / Sonnet 4.6.
+#
+# Mirror of _forbids_sampling_params() in agent/anthropic_adapter.py. The
+# Bedrock Converse API is a separate code path — we can't just share the
+# function because anthropic_adapter uses different kwargs keys.
+# ---------------------------------------------------------------------------
+_BEDROCK_NO_SAMPLING_PARAMS_SUBSTRINGS = ("claude-opus-4-7", "claude-opus-4.7")
+_BEDROCK_NO_TEMP_AND_TOP_P_SUBSTRINGS = (
+    "claude-opus-4-6",
+    "claude-opus-4.6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4.6",
+)
+
+
+def _bedrock_forbids_sampling_params(wire_model: str) -> bool:
+    """Return True if the Bedrock model rejects temperature/top_p entirely.
+
+    Opus 4.7 on Bedrock rejects any non-default temperature/top_p with a
+    ValidationException: "temperature is deprecated for this model." The
+    wire_model is the ID after :1m stripping (so both raw and 1M variants match).
+    """
+    lower = wire_model.lower()
+    return any(v in lower for v in _BEDROCK_NO_SAMPLING_PARAMS_SUBSTRINGS)
+
+
+def _bedrock_forbids_temp_and_top_p_together(wire_model: str) -> bool:
+    """Return True if the Bedrock model rejects BOTH temperature and top_p set together.
+
+    Opus 4.6 and Sonnet 4.6 on Bedrock: "temperature and top_p cannot both be set."
+    Either alone is fine. When both are passed, drop top_p (temperature is the
+    more commonly-set knob and the Anthropic adapter preserves it).
+    """
+    lower = wire_model.lower()
+    return any(v in lower for v in _BEDROCK_NO_TEMP_AND_TOP_P_SUBSTRINGS)
+
+
 # Base Claude model IDs that support the 1M context variant on Bedrock.
 # Includes the foundation-model IDs; regional/global inference-profile
 # prefixes are handled at runtime via the prefix check in
@@ -1317,6 +1409,21 @@ def build_converse_kwargs(
 
     if system_prompt:
         kwargs["system"] = system_prompt
+
+    # ── Sampling-param guards (Prax 2026-05-08) ────────────────────────
+    # Opus 4.7 rejects any non-default temperature/top_p with a
+    # ValidationException ("temperature is deprecated for this model").
+    # Opus 4.6 / Sonnet 4.6 reject temperature+top_p TOGETHER.
+    # Drop offending keys BEFORE we write them into inferenceConfig so the
+    # caller's default values never reach the wire. Region-independent.
+    if _bedrock_forbids_sampling_params(wire_model):
+        # Opus 4.7+ family — drop both entirely.
+        temperature = None
+        top_p = None
+    elif _bedrock_forbids_temp_and_top_p_together(wire_model):
+        # Opus 4.6 / Sonnet 4.6 — keep temperature, drop top_p if both set.
+        if temperature is not None and top_p is not None:
+            top_p = None
 
     if temperature is not None:
         kwargs["inferenceConfig"]["temperature"] = temperature
