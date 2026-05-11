@@ -331,21 +331,44 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
 
 
 def format_banner_version_label() -> str:
-    """Return the version label shown in the startup banner title."""
+    """Return the version label shown in the startup banner title.
+
+    Prax custom: also inject ``⚠ N BEHIND`` into the title when upstream has
+    moved ahead, so the count is visible BEFORE scrolling past the ~35-line
+    skills/MCP column. Complements the big footer line rendered under the
+    hero art (see make_banner). Mirrors the pending ``check_for_updates``
+    result without blocking — title just silently omits the segment when
+    the count isn't ready yet.
+    """
     base = f"Hermes Agent v{VERSION} ({RELEASE_DATE})"
     state = get_git_banner_state()
     if not state:
-        return base
+        label = base
+    else:
+        upstream = state["upstream"]
+        local = state["local"]
+        ahead = int(state.get("ahead") or 0)
+        if ahead <= 0 or upstream == local:
+            label = f"{base} · upstream {upstream}"
+        else:
+            carried_word = "commit" if ahead == 1 else "commits"
+            label = (
+                f"{base} · upstream {upstream} · local {local} "
+                f"(+{ahead} carried {carried_word})"
+            )
 
-    upstream = state["upstream"]
-    local = state["local"]
-    ahead = int(state.get("ahead") or 0)
-
-    if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
-
-    carried_word = "commit" if ahead == 1 else "commits"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
+    # Prax custom: non-blocking peek at prefetched update result.
+    try:
+        behind = get_update_result(timeout=0.0)
+    except Exception:
+        behind = None
+    if behind is not None and behind != 0:
+        if behind > 0:
+            commits_word = "COMMIT" if behind == 1 else "COMMITS"
+            label += f" · [bold #E55340]⚠ {behind} {commits_word} BEHIND[/]"
+        else:
+            label += " · [bold #E55340]⚠ UPDATE AVAILABLE[/]"
+    return label
 
 
 # =========================================================================
@@ -654,3 +677,45 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
         console.print(_logo)
         console.print()
     console.print(outer_panel)
+
+    # Prax custom: big, loud, impossible-to-miss update banner below the outer
+    # panel. The original right-column "⚠ N commits behind" line lives ~35 lines
+    # deep inside the skills column, which means by the time you scroll past the
+    # ASCII sigil and the big skill grid your eye has stopped reading. Render it
+    # AGAIN here in bold red against a dim crimson rule, centered, so it's the
+    # last thing you see before the prompt. Silent when up-to-date.
+    try:
+        _behind = get_update_result(timeout=0.0)
+    except Exception:
+        _behind = None
+    if _behind is not None and _behind != 0:
+        try:
+            from hermes_cli.config import (
+                get_managed_update_command,
+                recommended_update_command,
+            )
+            _cmd = get_managed_update_command() or recommended_update_command()
+        except Exception:
+            _cmd = "hermes update"
+        if _behind > 0:
+            _word = "COMMIT" if _behind == 1 else "COMMITS"
+            _msg = f"⚠  {_behind} {_word} BEHIND ORIGIN/MAIN  ⚠"
+        else:
+            _msg = "⚠  UPDATE AVAILABLE  ⚠"
+        _rule_color = _skin_color("ui_error", "#E55340")
+        _accent_color = _skin_color("banner_title", "#FFD700")
+        _pad = max((term_width - len(_msg) - 4) // 2, 0)
+        _rule_len = max(term_width - 4, 20)
+        console.print()
+        console.print(f"[bold {_rule_color}]{'━' * _rule_len}[/]")
+        console.print(
+            f"[bold {_rule_color} on #1A0A05]{' ' * _pad}  {_msg}  {' ' * _pad}[/]"
+        )
+        console.print(
+            f"[bold {_accent_color}]"
+            f"{' ' * max((term_width - len(_cmd) - 20) // 2, 0)}"
+            f"→ run [bold reverse] {_cmd} [/bold reverse] to update ←"
+            f"[/]"
+        )
+        console.print(f"[bold {_rule_color}]{'━' * _rule_len}[/]")
+        console.print()
