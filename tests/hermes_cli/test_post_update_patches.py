@@ -234,9 +234,29 @@ def test_anchor_patch_skip_when_old_text_missing(tmp_path, monkeypatch, caplog):
     assert any("old-text not found" in m for m in messages), messages
 
 
-def test_unknown_version_is_skipped(tmp_path, monkeypatch, caplog):
+def test_unknown_version_falls_back_to_latest_markers(tmp_path, monkeypatch, caplog):
+    """Unknown installed version → ``_find_latest_markers`` falls back.
+
+    When ``pi`` ships a new version before the patch maintainer creates a
+    matching ``pi-<version>.markers.json``, ``bedrock_guard`` gracefully
+    falls back to the newest available markers file under ``patches/dist/``.
+    That behaviour was added specifically to prevent silent
+    ``no marker set — skip`` regressions on every new upstream release.
+    See ``_find_latest_markers`` at bedrock_guard.py:82.
+
+    This test replaces the original ``test_unknown_version_is_skipped``,
+    which asserted the OPPOSITE (skip with "no marker set"). That was the
+    old pre-fallback behaviour; keeping the test would have locked a
+    regression in. We now have explicit coverage for BOTH:
+      * this test — fallback fires when another version's markers exist
+      * ``test_no_markers_at_all_is_skipped`` — skip fires when patches/dist
+        is empty or absent
+
+    (2026-05-11 — RCA of ``test_unknown_version_is_skipped`` flagging on the
+    rebase of ``feat/native-bedrock-provider-20260428``.)
+    """
     install = _make_install(tmp_path, version="99.0.0", files={})
-    # Only ship a patch set for a DIFFERENT version
+    # Ship a patch set for a DIFFERENT version — the fallback must find it.
     _make_patches(tmp_path, tool="pi", version="1.2.3", markers=[])
     data = tmp_path / "pi_data"
     _bind_install_root(monkeypatch, "pi", install)
@@ -246,7 +266,42 @@ def test_unknown_version_is_skipped(tmp_path, monkeypatch, caplog):
         bedrock_guard.check_pi()
 
     messages = [r.message for r in caplog.records]
-    assert any("no marker set" in m for m in messages), messages
+    # Fallback-found log MUST fire (the feature's whole point).
+    assert any(
+        "no exact markers" in m and "falling back" in m for m in messages
+    ), messages
+    # Empty marker list → "all 0 markers present ✓" success log.
+    assert any("all 0 markers present" in m for m in messages), messages
+    # And we must NOT fall through to the "no marker set" skip path —
+    # that would defeat the fallback.
+    assert not any("no marker set" in m for m in messages), messages
+
+
+def test_no_markers_at_all_is_skipped(tmp_path, monkeypatch, caplog):
+    """Truly empty patches dir → skip via ``no marker set``.
+
+    When ``patches/dist/`` exists but contains no ``pi-*.markers.json``
+    files (or doesn't exist at all), there's nothing for
+    ``_find_latest_markers`` to fall back to. ``check_pi`` must then log
+    ``no marker set — skip`` and return cleanly — this is the benign path
+    for tools that have been upstream-merged out of existence.
+    """
+    install = _make_install(tmp_path, version="99.0.0", files={})
+    # Build the data root with an EMPTY patches/dist dir — no markers files.
+    data_root = tmp_path / "pi_data"
+    (data_root / "patches" / "dist").mkdir(parents=True)
+    _bind_install_root(monkeypatch, "pi", install)
+    _bind_pi_home(monkeypatch, data_root)
+
+    with caplog.at_level("INFO"):
+        bedrock_guard.check_pi()
+
+    messages = [r.message for r in caplog.records]
+    assert any(
+        "no marker set" in m and "skip" in m for m in messages
+    ), messages
+    # And we must NOT have pretended to fall back to something.
+    assert not any("falling back" in m for m in messages), messages
 
 
 def test_not_installed_tool_is_skipped(monkeypatch, caplog):
