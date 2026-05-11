@@ -4,7 +4,8 @@ from unittest.mock import MagicMock, patch
 def test_format_banner_version_label_without_git_state():
     from hermes_cli import banner
 
-    with patch.object(banner, "get_git_banner_state", return_value=None):
+    with patch.object(banner, "get_git_banner_state", return_value=None), \
+         patch.object(banner, "get_update_result", return_value=None):
         value = banner.format_banner_version_label()
 
     assert value == f"Hermes Agent v{banner.VERSION} ({banner.RELEASE_DATE})"
@@ -17,7 +18,7 @@ def test_format_banner_version_label_on_upstream_main():
         banner,
         "get_git_banner_state",
         return_value={"upstream": "b2f477a3", "local": "b2f477a3", "ahead": 0},
-    ):
+    ), patch.object(banner, "get_update_result", return_value=None):
         value = banner.format_banner_version_label()
 
     assert value.endswith("· upstream b2f477a3")
@@ -31,12 +32,61 @@ def test_format_banner_version_label_with_carried_commits():
         banner,
         "get_git_banner_state",
         return_value={"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3},
-    ):
+    ), patch.object(banner, "get_update_result", return_value=None):
         value = banner.format_banner_version_label()
 
     assert "upstream b2f477a3" in value
     assert "local af8aad31" in value
     assert "+3 carried commits" in value
+
+
+def test_format_banner_version_label_appends_behind_warning():
+    """Prax custom: when upstream is ahead, the title must include ⚠ N BEHIND."""
+    from hermes_cli import banner
+
+    with patch.object(
+        banner,
+        "get_git_banner_state",
+        return_value={"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3},
+    ), patch.object(banner, "get_update_result", return_value=94):
+        value = banner.format_banner_version_label()
+
+    assert "⚠ 94 COMMITS BEHIND" in value
+    # Title stays a single logical line — no stray newlines injected.
+    assert "\n" not in value
+
+
+def test_format_banner_version_label_singular_commit_word():
+    from hermes_cli import banner
+
+    with patch.object(
+        banner,
+        "get_git_banner_state",
+        return_value={"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3},
+    ), patch.object(banner, "get_update_result", return_value=1):
+        value = banner.format_banner_version_label()
+
+    assert "⚠ 1 COMMIT BEHIND" in value
+    assert "COMMITS" not in value
+
+
+def test_format_banner_version_label_handles_nix_sentinel():
+    """``UPDATE_AVAILABLE_NO_COUNT`` (-1) must say "UPDATE AVAILABLE", not "-1 COMMITS BEHIND"."""
+    from hermes_cli import banner
+
+    with patch.object(
+        banner,
+        "get_git_banner_state",
+        return_value={"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3},
+    ), patch.object(
+        banner,
+        "get_update_result",
+        return_value=banner.UPDATE_AVAILABLE_NO_COUNT,
+    ):
+        value = banner.format_banner_version_label()
+
+    assert "UPDATE AVAILABLE" in value
+    assert "-1" not in value
 
 
 def test_get_git_banner_state_reads_origin_and_head(tmp_path):
