@@ -4887,6 +4887,38 @@ def resolve_provider_client(
 
                 auth_config = resolve_bedrock_auth_config()
                 region = str(auth_config.get("region") or "us-east-1").strip()
+                # Prax custom: derive region from the CRI prefix so fallback
+                # entries like ``eu.anthropic.claude-opus-4-7:1m`` actually
+                # route to eu-north-1 instead of whatever ``bedrock.region``
+                # happens to be pinned to. The CRI prefix IS the region
+                # indicator by convention (per AWS cross-region inference):
+                #   us.*  → us-east-1
+                #   eu.*  → eu-north-1
+                #   jp.*  → ap-northeast-3
+                #   au.*  → ap-southeast-2
+                # global.* and apac.* are multi-region CRIs that work in the
+                # account's default region; leave ``region`` alone for those.
+                _cri_region_map = {
+                    "us.": "us-east-1",
+                    "eu.": "eu-north-1",
+                    "jp.": "ap-northeast-3",
+                    "au.": "ap-southeast-2",
+                }
+                _model_lower = final_model.lower()
+                for _prefix, _expected_region in _cri_region_map.items():
+                    if _model_lower.startswith(_prefix):
+                        if region != _expected_region:
+                            logger.debug(
+                                "resolve_provider_client: CRI prefix %s "
+                                "overrides bedrock.region %s → %s",
+                                _prefix, region, _expected_region,
+                            )
+                            region = _expected_region
+                            # Update auth_config.region too so boto3 client
+                            # creation uses the correct endpoint hostname.
+                            auth_config = {**auth_config, "region": region}
+                        break
+
                 if is_anthropic_bedrock_model(final_model):
                     real_client = build_anthropic_bedrock_client(region, auth_config)
                 else:
