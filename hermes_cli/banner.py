@@ -400,9 +400,16 @@ def format_banner_version_label() -> str:
                 f"(+{ahead} carried {carried_word})"
             )
 
-    # Prax custom: non-blocking peek at prefetched update result.
+    # Prax custom: peek at prefetched update result with a small budget so
+    # cold-cache runs (first ``hermes`` after ~6h) still catch the count.
+    # ``check_for_updates`` takes ~3.6s when it has to hit the network
+    # (``git ls-remote origin main``); we'd rather give it a 500 ms grace
+    # than silently omit the widget. Banner is only printed once per launch,
+    # so a worst-case 500 ms pause is invisible next to skill/tool discovery.
+    # When the fetch is slower than 500 ms, we still fall through and the
+    # widget stays silent — same behaviour as before.
     try:
-        behind = get_update_result(timeout=0.0)
+        behind = get_update_result(timeout=0.5)
     except Exception:
         behind = None
     if behind is not None and behind != 0:
@@ -730,8 +737,14 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     # ASCII sigil and the big skill grid your eye has stopped reading. Render it
     # AGAIN here in bold red against a dim crimson rule, centered, so it's the
     # last thing you see before the prompt. Silent when up-to-date.
+    #
+    # Prax custom: same 500 ms grace as format_banner_version_label() — keep
+    # both widgets in lock-step so either BOTH appear or NEITHER does. The
+    # prefetch thread has already been running since early in main.py, so by
+    # the time make_banner() is called post-tool-discovery the result is
+    # usually ready; the grace only matters on the first cold-cache launch.
     try:
-        _behind = get_update_result(timeout=0.0)
+        _behind = get_update_result(timeout=0.5)
     except Exception:
         _behind = None
     if _behind is not None and _behind != 0:
