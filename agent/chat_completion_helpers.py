@@ -799,6 +799,37 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
+        # Prax custom: when the fallback is a Bedrock Converse model,
+        # update ``_bedrock_region`` from the fallback's base_url so
+        # subsequent converse() calls hit the correct region. Without
+        # this the agent stays pinned to the region it booted with
+        # (usually us-east-1), so fallback entries like
+        # ``eu.anthropic.claude-opus-4-7:1m`` routed to eu-north-1 in
+        # the config actually go to us-east-1 and fail with HTTP 400
+        # "invalid model identifier". Matches the CRI-prefix derivation
+        # added to ``resolve_provider_client`` in agent/auxiliary_client.py.
+        # (Originally landed in c5f87118e against the inline implementation
+        # in run_agent.py — moved here when upstream extracted the
+        # fallback policy to this helper module.)
+        if fb_api_mode == "bedrock_converse":
+            import re as _re
+            _m = _re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", fb_base_url or "")
+            if _m:
+                agent._bedrock_region = _m.group(1)
+            else:
+                # Fall back to CRI prefix if base_url didn't encode the region.
+                _cri_region_map = {
+                    "us.": "us-east-1",
+                    "eu.": "eu-north-1",
+                    "jp.": "ap-northeast-3",
+                    "au.": "ap-southeast-2",
+                }
+                _ml = fb_model.lower()
+                for _pfx, _reg in _cri_region_map.items():
+                    if _ml.startswith(_pfx):
+                        agent._bedrock_region = _reg
+                        break
+
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
