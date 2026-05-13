@@ -2690,11 +2690,22 @@ class HermesCLI:
             # erase-below) rather than \x1b[2J. Ctrl+L / /redraw should
             # repaint the viewport without nuking terminal scrollback.
             out.reset_attributes()
-            if rebuild_scrollback:
-                try:
-                    out.write_raw("\x1b[3J")
-                except Exception:
-                    pass
+            # PRAX-PATCH: rebuild_scrollback was emitting \x1b[3J (delete
+            # saved lines) which permanently nukes terminal scrollback under
+            # cmux/tmux/Ghostty/Warp/iTerm2. Upstream's intent was to avoid
+            # ghost status bars on resize and replay only the last 200 lines
+            # from _OUTPUT_HISTORY. The cost was unacceptable — losing every
+            # pre-hermes shell command + anything older than 200 lines on
+            # EVERY SIGWINCH (including spurious cmux tab-switch SIGWINCHes).
+            # Defanged: never emit \x1b[3J. The viewport clear below
+            # (cursor_goto + erase_down) is enough to remove ghost chrome.
+            # _OUTPUT_HISTORY replay still happens — user just keeps their
+            # actual terminal scrollback too.
+            # if rebuild_scrollback:
+            #     try:
+            #         out.write_raw("\x1b[3J")
+            #     except Exception:
+            #         pass
             out.cursor_goto(0, 0)
             out.erase_down()
             out.flush()
