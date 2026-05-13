@@ -30,11 +30,95 @@ from utils import base_url_host_matches, normalize_proxy_env_vars
 # paths. Access via the `_get_anthropic_sdk()` accessor below, which caches
 # the module after the first call and returns None on ImportError.
 _anthropic_sdk: Any = ...  # sentinel — None means "tried and missing"
+_APEX_BEARER_PATCH_ATTEMPTED: bool = False
+
+
+def _install_apex_bearer_auth_patch(_sdk) -> None:
+    """Patch anthropic SDK to honour AWS_BEARER_TOKEN_BEDROCK.
+
+    Why this exists:
+      anthropic>=0.86's AnthropicBedrock class signs every Bedrock request with
+      AWS SigV4 via ``boto3.Session(...).get_credentials()``. That call does
+      NOT auto-discover ``AWS_BEARER_TOKEN_BEDROCK`` — bearer-aware credential
+      resolution in botocore only fires when a service-context client is
+      constructed (``session.client('bedrock-runtime')``), not on the bare
+      session. So users who only have a Bedrock API key (no IAM access/secret
+      pair) see ``RuntimeError: could not resolve credentials from session``
+      at request time.
+
+      This patch replaces ``anthropic.lib.bedrock._auth.get_auth_headers``
+      with a bearer-first implementation: when the env var is set AND no
+      IAM creds are supplied, sign with ``Authorization: Bearer <token>`` and
+      skip SigV4 entirely (matching how boto3's bedrock-runtime client signs
+      in bearer-auth mode). When the env var is absent or IAM creds ARE
+      supplied, the original SigV4 logic runs unchanged (regression-safe).
+
+    Idempotent: guarded by a ``__apex_bearer_patched__`` attribute.
+    """
+    try:
+        from anthropic.lib.bedrock import _auth as _bedrock_auth_mod
+    except ImportError:
+        return  # older SDK variant — nothing to patch
+
+    if getattr(_bedrock_auth_mod.get_auth_headers, "__apex_bearer_patched__", False):
+        return  # already patched
+
+    _orig_get_auth_headers = _bedrock_auth_mod.get_auth_headers
+
+    def _bearer_aware_get_auth_headers(
+        *,
+        method,
+        url,
+        headers,
+        aws_access_key,
+        aws_secret_key,
+        aws_session_token,
+        region,
+        profile,
+        data,
+    ):
+        bearer = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip()
+        if bearer.lower().startswith("bearer "):
+            bearer = bearer[7:].strip()
+        # Prefer SigV4 when real IAM creds are available; bearer otherwise.
+        if bearer and not (aws_access_key and aws_secret_key):
+            out = {}
+            for k, v in dict(headers).items():
+                if v is None:
+                    continue
+                if k.lower() == "connection":
+                    # Original strips this header (may be removed by proxies);
+                    # preserve that behaviour so the signed-out request matches.
+                    continue
+                out[k] = v
+            out["Authorization"] = f"Bearer {bearer}"
+            return out
+        # Delegate to original SigV4 path.
+        return _orig_get_auth_headers(
+            method=method,
+            url=url,
+            headers=headers,
+            aws_access_key=aws_access_key,
+            aws_secret_key=aws_secret_key,
+            aws_session_token=aws_session_token,
+            region=region,
+            profile=profile,
+            data=data,
+        )
+
+    _bearer_aware_get_auth_headers.__apex_bearer_patched__ = True
+    _bedrock_auth_mod.get_auth_headers = _bearer_aware_get_auth_headers
+    try:
+        logger.info(
+            "AnthropicBedrock SDK: AWS_BEARER_TOKEN_BEDROCK bearer-auth patch installed"
+        )
+    except Exception:
+        pass  # logger may not be ready at import time
 
 
 def _get_anthropic_sdk():
     """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
-    global _anthropic_sdk
+    global _anthropic_sdk, _APEX_BEARER_PATCH_ATTEMPTED
     if _anthropic_sdk is ...:
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
@@ -49,6 +133,13 @@ def _get_anthropic_sdk():
             _anthropic_sdk = _sdk
         except ImportError:
             _anthropic_sdk = None
+    if _anthropic_sdk is not None and not _APEX_BEARER_PATCH_ATTEMPTED:
+        _APEX_BEARER_PATCH_ATTEMPTED = True
+        try:
+            _install_apex_bearer_auth_patch(_anthropic_sdk)
+        except Exception:
+            # Never let the patch break SDK access; fail open.
+            pass
     return _anthropic_sdk
 
 logger = logging.getLogger(__name__)
@@ -890,7 +981,13 @@ def build_anthropic_bedrock_client(
     method = auth_config.get("method", "default_chain")
 
     if method == "api_key":
-        kwargs["api_key"] = auth_config["api_key"]
+        # SDK compat: anthropic>=0.86 rejects api_key= on AnthropicBedrock.
+        # The class wraps boto3, and botocore>=1.34.145 auto-discovers
+        # AWS_BEARER_TOKEN_BEDROCK from the process env. We set the env
+        # var here (idempotent; .env already loaded it) so the default
+        # credential chain picks it up. No api_key= kwarg is passed.
+        import os as _os
+        _os.environ["AWS_BEARER_TOKEN_BEDROCK"] = auth_config["api_key"]
         return _anthropic_sdk.AnthropicBedrock(**kwargs)
 
     if method == "profile":
