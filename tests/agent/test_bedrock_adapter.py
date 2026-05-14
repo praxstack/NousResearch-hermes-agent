@@ -1514,6 +1514,144 @@ class TestIsStaleConnectionError:
         assert is_stale_connection_error(ValueError("bad input")) is False
         assert is_stale_connection_error(KeyError("missing")) is False
 
+    # ------------------------------------------------------------------
+    # Regression tests for f30b120ec / f81b5b253 (2026-05-14):
+    # urllib3 chunked-reader internal assertions fire mid-stream with an
+    # EMPTY message, after the inner client.converse_stream() call has
+    # already returned a botocore EventStream.  The frame walk is
+    # best-effort; some Python builds strip frames or bury the assert
+    # inside a cythonized path that has no python __name__ set.
+    # The empty-message fast-path catches those cases unconditionally.
+    # ------------------------------------------------------------------
+
+    def test_empty_message_assertion_error_via_fast_path(self):
+        """A bare ``AssertionError()`` with NO message must be classified as
+        stale even when the traceback is missing or has no library frames.
+
+        This is the fast-path added in f30b120ec.  Without it, frame-stripped
+        AssertionErrors from cythonized urllib3 paths would be misclassified
+        as application errors and the cached client would never be evicted
+        — the exact bug f30b120ec fixes.
+        """
+        from agent.bedrock_adapter import is_stale_connection_error
+        # No traceback at all (raw construction): fast-path must still fire.
+        assert is_stale_connection_error(AssertionError()) is True
+        # Empty-string message: fast-path must still fire.
+        assert is_stale_connection_error(AssertionError("")) is True
+
+    def test_non_empty_library_assertion_error_via_frame_walk(self):
+        """An AssertionError with a non-empty message must STILL be detected
+        as stale via the frame walk when raised from urllib3/botocore.
+
+        Existing ``test_detects_library_internal_assertion_error`` uses
+        ``assert False`` which has an empty message — that test now passes
+        through the fast-path before the frame walk runs.  This test locks
+        in the frame-walk path itself by giving the assert a real message.
+        """
+        from agent.bedrock_adapter import is_stale_connection_error
+        fake_globals = {"__name__": "urllib3.connectionpool"}
+        try:
+            exec(
+                'def _boom():\n'
+                '    assert False, "Connection pool invariant violated"\n'
+                '_boom()',
+                fake_globals,
+            )
+        except AssertionError as exc:
+            assert str(exc) == "Connection pool invariant violated", \
+                "fast-path must NOT short-circuit non-empty messages"
+            assert is_stale_connection_error(exc) is True, \
+                "frame walk must classify library-internal asserts as stale"
+        else:
+            pytest.fail("AssertionError not raised")
+
+    def test_stream_iteration_outer_except_evicts_cache(self):
+        """Regression for run_agent.py:7829-7849 (commit f30b120ec / f81b5b253).
+
+        The streaming consumer ``stream_converse_with_callbacks`` iterates a
+        botocore EventStream AFTER ``client.converse_stream()`` has already
+        returned.  urllib3 chunked-reader assertions fire HERE, not in the
+        inner call's try/except.  Before f30b120ec, the outer except in
+        ``_bedrock_call`` did NOT call ``invalidate_runtime_client(region)``,
+        so the cached client stayed poisoned and all 3 conversation-level
+        retries hit the same broken connection — masking as "fallback chain
+        works, primary mysteriously fails".
+
+        This test reproduces the exact try/except pattern from
+        run_agent.py:7829-7849 and verifies eviction fires on a bare
+        AssertionError raised from the streaming consumer.
+        """
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            is_stale_connection_error,
+            reset_client_cache,
+        )
+
+        reset_client_cache()
+        region = "us-east-1"
+        poisoned_client = MagicMock(name="poisoned-bedrock-client")
+        # Pre-seed both bare and composite cache forms — invalidate must clear both.
+        _bedrock_runtime_client_cache[region] = poisoned_client
+        _bedrock_runtime_client_cache[
+            f"bedrock-runtime:{region}:default_chain:default_chain"
+        ] = poisoned_client
+
+        # Mirror the exact pattern at run_agent.py:7829-7849.  Any divergence
+        # here means the production code path no longer matches what we test.
+        result = {"error": None}
+
+        def _simulate_stream_iteration():
+            # The streaming consumer raises a bare AssertionError mid-iteration.
+            # Empty message is the urllib3 chunked-reader signature.
+            raise AssertionError()
+
+        try:
+            _simulate_stream_iteration()
+        except Exception as e:
+            try:
+                if is_stale_connection_error(e):
+                    invalidate_runtime_client(region)
+            except Exception:  # pragma: no cover - defensive guard from prod
+                pass
+            result["error"] = e
+
+        assert isinstance(result["error"], AssertionError), \
+            "outer except must capture the AssertionError as the result error"
+        assert region not in _bedrock_runtime_client_cache, \
+            "bare-region cache entry must be evicted"
+        assert not any(region in k for k in _bedrock_runtime_client_cache), \
+            "composite-key cache entry must also be evicted"
+
+    def test_stream_iteration_outer_except_does_not_evict_on_app_error(self):
+        """Inverse of above: a non-stale exception raised mid-stream must
+        leave the cached client alone.  Otherwise we'd churn connections on
+        every benign error (validation failures, application asserts, etc).
+        """
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            invalidate_runtime_client,
+            is_stale_connection_error,
+            reset_client_cache,
+        )
+
+        reset_client_cache()
+        region = "us-east-1"
+        live_client = MagicMock(name="live-bedrock-client")
+        _bedrock_runtime_client_cache[region] = live_client
+
+        try:
+            raise ValueError("benign application error")
+        except Exception as e:
+            try:
+                if is_stale_connection_error(e):
+                    invalidate_runtime_client(region)
+            except Exception:  # pragma: no cover
+                pass
+
+        assert _bedrock_runtime_client_cache.get(region) is live_client, \
+            "non-stale errors must not evict the cached client"
+
 
 class TestCallConverseInvalidatesOnStaleError:
     """call_converse / call_converse_stream evict the cached client when the
