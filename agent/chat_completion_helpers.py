@@ -1262,6 +1262,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_interrupt_check=lambda: agent._interrupt_requested,
                 )
             except Exception as e:
+                # Prax custom (046a14e7d, 2026-05-14): The streaming consumer
+                # (stream_converse_with_callbacks) iterates a botocore
+                # EventStream. urllib3 chunked-reader asserts and connection-
+                # pool failures fire HERE, NOT in the inner converse_stream()
+                # try/except above. Without eviction, the cached client stays
+                # poisoned and all 3 retries hit the same broken connection —
+                # diagnosed after multi-day repro of "AssertionError after
+                # compression on us-east-1, 3 retries fail, JP fallback works
+                # (different cached client), new session works (empty cache)".
+                try:
+                    if is_stale_connection_error(e):
+                        invalidate_runtime_client(region)
+                except Exception:
+                    pass
                 result["error"] = e
 
         t = threading.Thread(target=_bedrock_call, daemon=True)
