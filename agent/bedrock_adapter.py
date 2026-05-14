@@ -230,6 +230,15 @@ def is_stale_connection_error(exc: BaseException) -> bool:
 
     # Library-internal AssertionError (urllib3 / botocore / boto3)
     if isinstance(exc, AssertionError):
+        # Fast-path: an AssertionError whose ``str(exc)`` is empty matches
+        # the documented urllib3 chunked-reader / connection-pool signature
+        # at lines 184-186 above. Frame-walking is best-effort — frames can
+        # be stripped on some Python builds, or the assert can fire from a
+        # cythonized path that lacks a python __name__. Treat empty-message
+        # AssertionError as stale-connection regardless of the frame walk
+        # so the cached client is evicted and the next attempt rebuilds.
+        if str(exc) == "":
+            return True
         for module in _traceback_frames_modules(exc):
             if any(module.startswith(prefix) for prefix in _STALE_LIB_MODULE_PREFIXES):
                 return True
