@@ -921,10 +921,18 @@ class AIAgent:
 
         from agent.chat_completion_helpers import estimate_request_context_tokens
         est_tokens = estimate_request_context_tokens(api_payload)
+        # 2026-05-13: env-controllable heavy-context floor.
+        # Pre-fix the heavy-context floors were hardcoded, which meant a stale
+        # us-east-1 region with 100K+ context wasted ~9 min before detection
+        # (real incident 2026-05-13 7:13PM IST: 541s wait per cycle × 4 retry
+        # cycles = 36 min lost on a routine task). Allow operator to tighten or
+        # extend via HERMES_HEAVY_CONTEXT_STALE_FLOOR_100K + _50K env vars.
+        heavy_100k_floor = float(os.environ.get("HERMES_HEAVY_CONTEXT_STALE_FLOOR_100K", "240.0"))
+        heavy_50k_floor = float(os.environ.get("HERMES_HEAVY_CONTEXT_STALE_FLOOR_50K", "150.0"))
         if est_tokens > 100_000:
-            return max(stale_base, 240.0)
+            return max(stale_base, heavy_100k_floor)
         if est_tokens > 50_000:
-            return max(stale_base, 150.0)
+            return max(stale_base, heavy_50k_floor)
         return stale_base
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
