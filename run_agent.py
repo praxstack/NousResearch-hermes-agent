@@ -3461,11 +3461,21 @@ class AIAgent:
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
+        # Fix A (2026-05-13): env-controllable heavy-context floor.
+        # Pre-fix the heavy-context floors were hardcoded at 600s/450s, which
+        # meant a stale us-east-1 region with 100K+ context wasted ~9 min before
+        # detection (real incident 2026-05-13 7:13PM IST: 541s wait per cycle ×
+        # 4 retry cycles = 36 min lost on a routine task). Allow operator to
+        # tighten via HERMES_HEAVY_CONTEXT_STALE_FLOOR_100K + _50K env vars.
+        # Defaults preserved (600/450) for callers who haven't opted in.
+        heavy_100k_floor = float(os.environ.get("HERMES_HEAVY_CONTEXT_STALE_FLOOR_100K", "600.0"))
+        heavy_50k_floor = float(os.environ.get("HERMES_HEAVY_CONTEXT_STALE_FLOOR_50K", "450.0"))
+
         est_tokens = sum(len(str(v)) for v in messages) // 4
         if est_tokens > 100_000:
-            return max(stale_base, 600.0)
+            return max(stale_base, heavy_100k_floor)
         if est_tokens > 50_000:
-            return max(stale_base, 450.0)
+            return max(stale_base, heavy_50k_floor)
         return stale_base
 
     def _is_openrouter_url(self) -> bool:
@@ -7908,6 +7918,25 @@ class AIAgent:
                         on_interrupt_check=lambda: self._interrupt_requested,
                     )
                 except Exception as e:
+                    # The streaming consumer (stream_converse_with_callbacks)
+                    # iterates a botocore EventStream. urllib3 chunked-reader
+                    # asserts and connection-pool failures fire here, NOT in
+                    # the inner client.converse_stream() try/except above.
+                    # Without this, the cached client stays poisoned and all
+                    # 3 retries hit the same broken connection — diagnosed
+                    # 2026-05-14 IST after multi-day repro of "AssertionError
+                    # after compression on us-east-1, 3 retries fail, JP
+                    # fallback works (different cached client), new session
+                    # works (empty cache)".
+                    try:
+                        from agent.bedrock_adapter import (
+                            invalidate_runtime_client,
+                            is_stale_connection_error,
+                        )
+                        if is_stale_connection_error(e):
+                            invalidate_runtime_client(region)
+                    except Exception:
+                        pass
                     result["error"] = e
 
             t = threading.Thread(target=_bedrock_call, daemon=True)
@@ -8564,11 +8593,19 @@ class AIAgent:
             # when the context is large.  Without this, the stale detector kills
             # healthy connections during the model's thinking phase, producing
             # spurious RemoteProtocolError ("peer closed connection").
+            #
+            # Fix A (2026-05-13): floors are env-controllable. Defaults preserved
+            # (300/240) for callers who haven't opted in.  Operator can tighten
+            # via HERMES_STREAM_HEAVY_FLOOR_100K + _50K to detect dead regions
+            # faster.  See _compute_non_stream_stale_timeout for the same pattern
+            # on the non-stream path.
+            _heavy_100k_stream_floor = float(os.getenv("HERMES_STREAM_HEAVY_FLOOR_100K", "300.0"))
+            _heavy_50k_stream_floor = float(os.getenv("HERMES_STREAM_HEAVY_FLOOR_50K", "240.0"))
             _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
             if _est_tokens > 100_000:
-                _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
+                _stream_stale_timeout = max(_stream_stale_timeout_base, _heavy_100k_stream_floor)
             elif _est_tokens > 50_000:
-                _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+                _stream_stale_timeout = max(_stream_stale_timeout_base, _heavy_50k_stream_floor)
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
 
@@ -8629,6 +8666,27 @@ class AIAgent:
                     f"context: ~{_est_ctx:,} tokens). "
                     f"Reconnecting..."
                 )
+                # Fix C (2026-05-13): Mac-level notification on stale stream so
+                # Prax sees the regional outage immediately even if the TUI is
+                # backgrounded. Best-effort: missing osascript is silently
+                # tolerated (Linux gateway hosts have no osascript).
+                try:
+                    import subprocess
+                    _model_short = str(api_kwargs.get("model", "unknown")).rsplit(".", 1)[-1]
+                    _osa = (
+                        f'display notification '
+                        f'"Stale {int(_stale_elapsed)}s on {_model_short} — '
+                        f'falling back" '
+                        f'with title "Hermes — Bedrock region stalled" '
+                        f'sound name "Basso"'
+                    )
+                    subprocess.run(
+                        ["osascript", "-e", _osa],
+                        timeout=2, check=False,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
                 try:
                     rc = request_client_holder.get("client")
                     if rc is not None:
@@ -15251,14 +15309,20 @@ class AIAgent:
                             continue
 
                         # ── Empty response retry ──────────────────────
-                        # Model returned nothing usable.  Retry up to 3
-                        # times before attempting fallback.  This covers
-                        # both truly empty responses (no content, no
-                        # reasoning) AND reasoning-only responses after
-                        # prefill exhaustion — models like mimo-v2-pro
-                        # always populate reasoning fields via OpenRouter,
-                        # so the old `not _has_structured` guard blocked
-                        # retries for every reasoning model after prefill.
+                        # Model returned nothing usable.  Retry up to 1
+                        # time before attempting fallback (Fix B 2026-05-13:
+                        # was 3 retries; reduced because empty-response from
+                        # a region almost always means structural region-side
+                        # issue, not transient. 3 retries × full kwargs resent
+                        # = ~6-10 min waste before we move on. 1 retry covers
+                        # the genuinely-transient case without burning the
+                        # budget on a known-dead region).  This covers both
+                        # truly empty responses (no content, no reasoning)
+                        # AND reasoning-only responses after prefill
+                        # exhaustion — models like mimo-v2-pro always
+                        # populate reasoning fields via OpenRouter, so the
+                        # old `not _has_structured` guard blocked retries
+                        # for every reasoning model after prefill.
                         _truly_empty = not self._strip_think_blocks(
                             final_response
                         ).strip()
@@ -15266,16 +15330,17 @@ class AIAgent:
                             _has_structured
                             and self._thinking_prefill_retries >= 2
                         )
-                        if _truly_empty and (not _has_structured or _prefill_exhausted) and self._empty_content_retries < 3:
+                        _empty_retry_cap = int(os.environ.get("HERMES_EMPTY_RESPONSE_RETRIES", "1"))
+                        if _truly_empty and (not _has_structured or _prefill_exhausted) and self._empty_content_retries < _empty_retry_cap:
                             self._empty_content_retries += 1
                             logger.warning(
                                 "Empty response (no content or reasoning) — "
-                                "retry %d/3 (model=%s)",
-                                self._empty_content_retries, self.model,
+                                "retry %d/%d (model=%s)",
+                                self._empty_content_retries, _empty_retry_cap, self.model,
                             )
                             self._emit_status(
                                 f"⚠️ Empty response from model — retrying "
-                                f"({self._empty_content_retries}/3)"
+                                f"({self._empty_content_retries}/{_empty_retry_cap})"
                             )
                             continue
 
