@@ -141,3 +141,4 @@ apps/desktop/demo/
 openmemory.db
 openmemory.db-shm
 openmemory.db-wal
+.pi-lens/
