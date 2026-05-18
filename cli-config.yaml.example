@@ -143,6 +143,32 @@ model:
 #   response_cache_ttl: 300      # Cache TTL in seconds, 1-86400 (default: 300)
 
 # =============================================================================
+# AWS Bedrock Provider (only applies when model.provider is "bedrock")
+# =============================================================================
+# Bedrock-specific knobs. The runtime defaults are written to ~/.hermes/config.yaml
+# by `hermes setup`; the keys below are the most commonly hand-edited ones.
+# See: https://hermes-agent.nousresearch.com/docs/guides/aws-bedrock
+#
+# bedrock:
+#   region: us-east-1                   # AWS region for Bedrock API calls
+#   auth_method: default_chain          # api_key | profile | credentials | default_chain
+#   profile: ""                         # Used when auth_method == profile
+#   use_prompt_caching: true            # Anthropic prompt caching on supported models
+#
+#   # Optional: route Bedrock traffic through a VPC interface endpoint for
+#   # enterprise / private-network deployments. When unset, Hermes falls back
+#   # to the AWS_ENDPOINT_URL_BEDROCK_RUNTIME / AWS_ENDPOINT_URL env vars
+#   # (same precedence as the AWS CLI). The config key wins over both env vars.
+#   # Example: vpc_endpoint_url: https://bedrock-runtime.us-east-1.vpce.amazonaws.com
+#   # vpc_endpoint_url: ""
+#
+#   guardrail:
+#     guardrail_identifier: ""          # e.g. "abc123def456" (from Bedrock console)
+#     guardrail_version: ""             # e.g. "1" or "DRAFT"
+#     stream_processing_mode: async     # "sync" or "async"
+#     trace: disabled                   # "enabled" | "disabled" | "enabled_full"
+
+# =============================================================================
 # Git Worktree Isolation
 # =============================================================================
 # When enabled, each CLI session creates an isolated git worktree so multiple
