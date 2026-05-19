@@ -2049,12 +2049,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         else:
             _stream_stale_timeout = _stream_stale_timeout_base
 
+    # Hard wall-clock cap for streaming — prevents infinite stale-kill-reconnect.
+    # PRAX-PATCH: HERMES_STREAM_WALL_TIMEOUT (default 900s) bounds total streaming time.
+    _streaming_wall_cap = float(os.getenv("HERMES_STREAM_WALL_TIMEOUT", 900.0))
+    _streaming_start = time.time()
+
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
     while t.is_alive():
         t.join(timeout=0.3)
+
+        # PRAX-PATCH: Hard wall-clock cap — abort if total streaming time exceeded.
+        if (time.time() - _streaming_start) > _streaming_wall_cap:
+            logger.warning("Streaming wall-clock cap (%.0fs) exceeded — aborting.", _streaming_wall_cap)
+            try:
+                rc = request_client_holder.get("client") if 'request_client_holder' in dir() else None
+                if rc is not None:
+                    agent._close_request_openai_client(rc, reason="wall_cap_abort")
+            except Exception:
+                pass
+            result["error"] = TimeoutError(f"Streaming wall-clock cap ({_streaming_wall_cap}s) exceeded")
+            break
 
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting

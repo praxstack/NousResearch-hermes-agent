@@ -8680,9 +8680,13 @@ class GatewayRunner:
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
+            _hook_adapter = self.adapters.get(source.platform) if source.platform else None
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
+                "messages": agent_messages,
+                "adapter": _hook_adapter,
+                "chat_id": str(source.chat_id),
             })
             
             # Check for pending process watchers (check_interval on background processes)

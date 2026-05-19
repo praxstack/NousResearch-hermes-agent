@@ -5405,6 +5405,59 @@ def _discover_bedrock_model_list(region, current_model="", config_preview=None):
         return None
 
 
+def _validate_bedrock_vpc_endpoint_url(value: str) -> tuple[bool, str]:
+    """Validate a Bedrock VPC endpoint URL.
+
+    Returns ``(ok, error_message)``. An ``ok`` of True means the URL parses
+    cleanly with both an ``https://`` (or ``http://``) scheme and a host.
+    Empty input is rejected here — callers handle the skip path themselves
+    so the validator stays simple and unambiguous.
+    """
+    from urllib.parse import urlparse
+
+    candidate = (value or "").strip()
+    if not candidate:
+        return False, "URL is empty."
+    try:
+        parsed = urlparse(candidate)
+    except (ValueError, TypeError) as exc:
+        return False, f"Could not parse URL: {exc}"
+    if parsed.scheme.lower() not in ("https", "http"):
+        return False, "URL must start with https:// (or http:// for testing)."
+    if not parsed.netloc:
+        return False, "URL must include a host (e.g. https://vpce-xxxx.bedrock-runtime.us-east-1.vpce.amazonaws.com)."
+    return True, ""
+
+
+def _prompt_bedrock_vpc_endpoint_url(current_value: str = "") -> str:
+    """Prompt for an optional Bedrock VPC endpoint URL.
+
+    - Empty input keeps the current value (or stays unset when none).
+    - Non-empty input is lightly validated; invalid URLs re-prompt with a
+      helpful error message.
+    - ``KeyboardInterrupt`` / ``EOFError`` are propagated so callers can
+      cancel the surrounding flow consistently with the other Bedrock
+      prompts in this module.
+    """
+    current = (current_value or "").strip()
+    print(
+        "  VPC endpoint URL — optional, for PrivateLink / VPC endpoints to\n"
+        "  Bedrock. Leave blank to use the default AWS endpoints."
+    )
+    suffix = f" [{current}]" if current else " (blank to skip)"
+    while True:
+        try:
+            raw = input(f"  VPC endpoint URL{suffix}: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            raise
+        if not raw:
+            return current
+        ok, err = _validate_bedrock_vpc_endpoint_url(raw)
+        if ok:
+            return raw
+        print(f"  ✗ {err} Try again, or press Enter to skip.")
+
+
 def _save_bedrock_model_selection(
     selected,
     region,
@@ -5414,6 +5467,7 @@ def _save_bedrock_model_selection(
     use_cross_region_inference: bool = True,
     use_global_inference_profile: bool = True,
     use_prompt_caching: bool = True,
+    vpc_endpoint_url: str = "",
 ):
     from hermes_cli.auth import deactivate_provider
     from hermes_cli.config import get_env_value, load_config, save_config, save_env_value
@@ -5447,6 +5501,15 @@ def _save_bedrock_model_selection(
     bedrock_cfg["use_cross_region_inference"] = bool(use_cross_region_inference)
     bedrock_cfg["use_global_inference_profile"] = bool(use_global_inference_profile)
     bedrock_cfg["use_prompt_caching"] = bool(use_prompt_caching)
+
+    # vpc_endpoint_url — only persist when explicitly set so the default
+    # config block stays minimal. Empty value clears any prior key, which
+    # also matches the documented "skip = no key written" behavior.
+    _vpc = str(vpc_endpoint_url or "").strip()
+    if _vpc:
+        bedrock_cfg["vpc_endpoint_url"] = _vpc
+    else:
+        bedrock_cfg.pop("vpc_endpoint_url", None)
 
     cfg["bedrock"] = bedrock_cfg
 
@@ -5517,6 +5580,7 @@ def _model_flow_bedrock_api_key(
     _default_cri = bedrock_preview.get("use_cross_region_inference", True)
     _default_global = bedrock_preview.get("use_global_inference_profile", True)
     _default_cache = bedrock_preview.get("use_prompt_caching", True)
+    _default_vpc = str(bedrock_preview.get("vpc_endpoint_url") or "").strip()
 
     def _yn(prompt_text, dv):
         ds = "Y/n" if dv else "y/N"
@@ -5530,6 +5594,7 @@ def _model_flow_bedrock_api_key(
         use_cri = _yn("Use cross-region inference?", _default_cri)
         use_global = _yn("Use global inference profile when available?", _default_global) if use_cri else False
         use_cache = _yn("Enable prompt caching?", _default_cache)
+        vpc_endpoint_url = _prompt_bedrock_vpc_endpoint_url(_default_vpc)
     except (KeyboardInterrupt, EOFError):
         print()
         return
@@ -5550,6 +5615,7 @@ def _model_flow_bedrock_api_key(
         use_cross_region_inference=use_cri,
         use_global_inference_profile=use_global,
         use_prompt_caching=use_cache,
+        vpc_endpoint_url=vpc_endpoint_url,
     )
     print(f"  Default model set to: {selected} (via AWS Bedrock API Key, {region})")
 
@@ -5681,6 +5747,7 @@ def _model_flow_bedrock(config, current_model=""):
     _default_cri = _existing_bedrock_cfg.get("use_cross_region_inference", True)
     _default_global = _existing_bedrock_cfg.get("use_global_inference_profile", True)
     _default_cache = _existing_bedrock_cfg.get("use_prompt_caching", True)
+    _default_vpc = str(_existing_bedrock_cfg.get("vpc_endpoint_url") or "").strip()
 
     def _yes_no(prompt_text, default_value):
         """Prompt for a y/n choice with a default."""
@@ -5715,6 +5782,8 @@ def _model_flow_bedrock(config, current_model=""):
             "  by up to 90%% on repeated context. Recommended for long conversations.\n"
         )
         use_prompt_caching = _yes_no("Enable prompt caching?", _default_cache)
+
+        vpc_endpoint_url = _prompt_bedrock_vpc_endpoint_url(_default_vpc)
     except (KeyboardInterrupt, EOFError):
         print()
         return
@@ -5743,6 +5812,7 @@ def _model_flow_bedrock(config, current_model=""):
         use_cross_region_inference=use_cross_region_inference,
         use_global_inference_profile=use_global_inference_profile,
         use_prompt_caching=use_prompt_caching,
+        vpc_endpoint_url=vpc_endpoint_url,
     )
     print(f"  Default model set to: {selected} (via AWS Bedrock, {region})")
 
