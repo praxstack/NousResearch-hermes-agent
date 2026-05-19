@@ -60,6 +60,26 @@ _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
 
 
+def _bedrock_boto_config():
+    """Lazily create a botocore Config with Bedrock-safe timeouts.
+
+    Returns None if botocore isn't importable (shouldn't happen if boto3 is
+    installed, but fail-open so we don't break existing behaviour).
+    """
+    try:
+        from botocore.config import Config
+    except ImportError:
+        return None
+    # tcp_keepalive=True keeps the connection healthy across macOS sleep/wake
+    # cycles, which matters when a long thinking call straddles a lid-close.
+    return Config(
+        read_timeout=3600,       # 1 hour — matches Bedrock server-side timeout
+        connect_timeout=60,      # generous DNS+TCP+TLS handshake window
+        retries={"max_attempts": 0},  # disable boto-level retries; hermes layer handles fallback
+        tcp_keepalive=True,
+    )
+
+
 def _require_boto3():
     """Import boto3, raising a clear error if not installed."""
     try:
@@ -769,6 +789,7 @@ def _masked_aws_env(mask_keys: Tuple[str, ...]):
 
 def _create_bedrock_client(service: str, region: str, auth_config: Dict[str, str]):
     boto3 = _require_boto3()
+    _boto_cfg = _bedrock_boto_config()  # PRAX-PATCH: 3600s read_timeout for Claude 4 long-thinking
     method = auth_config.get("method", "default_chain")
 
     # VPC endpoint support: when configured, all service clients route through
@@ -780,12 +801,12 @@ def _create_bedrock_client(service: str, region: str, auth_config: Dict[str, str
 
     if method == "api_key":
         with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY):
-            return boto3.client(service, region_name=region, **extra_kwargs)
+            return boto3.client(service, region_name=region, config=_boto_cfg, **extra_kwargs)
 
     if method == "profile":
         with _masked_aws_env(_AWS_ENV_MASK_FOR_PROFILE):
             session = boto3.Session(profile_name=auth_config["profile"])
-            return session.client(service, region_name=region, **extra_kwargs)
+            return session.client(service, region_name=region, config=_boto_cfg, **extra_kwargs)
 
     if method == "credentials":
         kwargs: Dict[str, Any] = {
@@ -797,10 +818,10 @@ def _create_bedrock_client(service: str, region: str, auth_config: Dict[str, str
             kwargs["aws_session_token"] = auth_config["session_token"]
         kwargs.update(extra_kwargs)
         with _masked_aws_env(_AWS_ENV_MASK_FOR_CREDENTIALS):
-            return boto3.client(service, **kwargs)
+            return boto3.client(service, config=_boto_cfg, **kwargs)
 
     with _masked_aws_env(_AWS_ENV_MASK_FOR_DEFAULT_CHAIN):
-        return boto3.client(service, region_name=region, **extra_kwargs)
+        return boto3.client(service, region_name=region, config=_boto_cfg, **extra_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1387,7 +1408,7 @@ def build_converse_kwargs(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 64000,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -1480,7 +1501,7 @@ def call_converse(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 64000,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -1521,7 +1542,7 @@ def call_converse_stream(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 64000,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
