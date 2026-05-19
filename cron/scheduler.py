@@ -1672,9 +1672,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
                     _raw_cron_timeout,
                 )
-                _cron_timeout = 600.0
+                _cron_timeout = 1800.0
         else:
-            _cron_timeout = 600.0
+            _cron_timeout = 1800.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)

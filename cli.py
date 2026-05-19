@@ -3493,10 +3493,28 @@ class HermesCLI:
         if len(model_short) > 26:
             model_short = f"{model_short[:23]}..."
 
+        # ── Region tag for Bedrock (Prax custom, 2026-05-07) ──
+        # Extract "bedrock-runtime.eu-north-1.amazonaws.com" → "eu-n1"
+        # so the TUI shows WHICH region is active. Critical when fallback
+        # rotates through multiple regions.
+        region_tag = ""
+        _base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None) or ""
+        if "bedrock-runtime." in _base_url:
+            import re as _re
+            _m = _re.search(r"bedrock-runtime\.([a-z0-9-]+)\.amazonaws", _base_url)
+            if _m:
+                _parts = _m.group(1).split("-")
+                if len(_parts) == 3:
+                    # "eu-north-1" → "eu-n1"; "us-east-1" → "us-e1"
+                    region_tag = f"{_parts[0]}-{_parts[1][0]}{_parts[2]}"
+                else:
+                    region_tag = _m.group(1)
+
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "region_tag": region_tag,
             "duration": format_duration_compact(elapsed_seconds),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
@@ -3791,7 +3809,12 @@ class HermesCLI:
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            # Region tag inserted after model_short (Prax custom 2026-05-07)
+            _region = snapshot.get("region_tag") or ""
+            _model_with_region = f"⚕ {snapshot['model_short']}"
+            if _region:
+                _model_with_region = f"⚕ {snapshot['model_short']} · {_region}"
+            parts = [_model_with_region, context_label, percent_label]
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -12783,6 +12806,17 @@ class HermesCLI:
                 conflicting Hermes binding. See issue #22379.
                 """
                 event.current_buffer.insert_text('\n')
+
+        # Prax custom (post-update hook): Shift+Enter (s-enter) inserts a newline
+        # on Kitty keyboard protocol terminals (Ghostty, Kitty, WezTerm).
+        # Wrapped in try/except because older prompt_toolkit doesn't know s-enter.
+        try:
+            @kb.add('s-enter')
+            def handle_shift_enter(event):
+                """Shift+Enter inserts a newline (Kitty keyboard protocol — Ghostty, Kitty, WezTerm)."""
+                event.current_buffer.insert_text('\n')
+        except (ValueError, KeyError):
+            pass  # prompt_toolkit version doesn't support 's-enter'
 
         # VSCode/Cursor bind Ctrl+G to "Find Next" at the editor level, so
         # the keystroke never reaches the embedded terminal. Alt+G is unbound
