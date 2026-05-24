@@ -134,3 +134,82 @@ class TestGovCloudAndChinaCarveOut:
         # that's actually fine — AWS treats global.* as partition-agnostic
         # in docs. We keep the assertion loose: must NOT be us.*.
         assert not runtime["bedrock_model"].startswith("us.")
+
+
+class TestCRIRegionRoundTripIdentity:
+    """Code review P1-B + P1-C regression tests (2026-05-24).
+
+    Before the fix, three sites had divergent CRI mapping logic:
+      - hermes_cli/runtime_provider.py (forward: region → prefix)
+      - agent/auxiliary_client.py (reverse: prefix → region)
+      - agent/chat_completion_helpers.py (reverse: prefix → region)
+
+    Bugs found:
+      P1-B: ap-southeast-2 routed to apac.* (dead `au-` branch never matched)
+      P1-C: forward (apac.) and reverse (au.→ap-southeast-2) disagreed
+            on Sydney's canonical pair → round-trip broken
+
+    Fix: single source of truth in agent.bedrock_adapter.BEDROCK_CRI_REGIONS
+    + cri_prefix_for_region() called from forward path.
+    """
+
+    def test_ap_southeast_2_maps_to_au_not_apac(self, mock_bedrock_env):
+        """Sydney is the entry-point for the Australia profile, not generic apac."""
+        runtime = _call_resolver(
+            "ap-southeast-2", "anthropic.claude-sonnet-4-20250514-v1:0", use_global=False
+        )
+        assert runtime["bedrock_model"] == "au.anthropic.claude-sonnet-4-20250514-v1:0", (
+            "P1-B: ap-southeast-2 → au.* (was incorrectly apac.* via dead au- branch)"
+        )
+
+    def test_other_ap_regions_get_apac_not_au(self, mock_bedrock_env):
+        """ap-southeast-1 (Singapore) is generic apac, NOT au — only Sydney is au."""
+        runtime = _call_resolver(
+            "ap-southeast-1", "anthropic.claude-sonnet-4-20250514-v1:0", use_global=False
+        )
+        assert runtime["bedrock_model"] == "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+
+    def test_round_trip_identity_for_canonical_regions(self):
+        """For every region in BEDROCK_CRI_REGIONS, region → prefix → region == identity."""
+        from agent.bedrock_adapter import BEDROCK_CRI_REGIONS, cri_prefix_for_region
+        for prefix, region in BEDROCK_CRI_REGIONS.items():
+            forward_prefix = cri_prefix_for_region(region)
+            assert forward_prefix == prefix, (
+                f"Round-trip broken for {region}: "
+                f"forward={forward_prefix!r}, reverse={prefix!r}"
+            )
+
+    def test_jp_prefix_uses_ap_northeast_3(self):
+        from agent.bedrock_adapter import BEDROCK_CRI_REGIONS
+        assert BEDROCK_CRI_REGIONS["jp."] == "ap-northeast-3"
+
+    def test_ap_northeast_1_through_3_all_map_to_jp(self):
+        """All three Tokyo/Seoul/Osaka regions route to the jp.* profile."""
+        from agent.bedrock_adapter import cri_prefix_for_region
+        assert cri_prefix_for_region("ap-northeast-1") == "jp."
+        assert cri_prefix_for_region("ap-northeast-2") == "jp."
+        assert cri_prefix_for_region("ap-northeast-3") == "jp."
+
+    def test_govcloud_china_return_none_not_apac(self):
+        """GovCloud + China have no CRI profiles — reverse must return None, not coerce to apac."""
+        from agent.bedrock_adapter import cri_prefix_for_region
+        assert cri_prefix_for_region("us-gov-west-1") is None
+        assert cri_prefix_for_region("us-gov-east-1") is None
+        assert cri_prefix_for_region("cn-north-1") is None
+        assert cri_prefix_for_region("cn-northwest-1") is None
+
+    def test_inference_profile_prefixes_tuple_in_sync(self):
+        """All CRI region map keys must appear in BEDROCK_INFERENCE_PROFILE_PREFIXES.
+
+        The tuple is the public surface used by the prefix-stripper / matcher;
+        adding an entry to the dict without adding to the tuple would silently
+        break is-this-a-CRI-already detection.
+        """
+        from agent.bedrock_adapter import (
+            BEDROCK_CRI_REGIONS,
+            BEDROCK_INFERENCE_PROFILE_PREFIXES,
+        )
+        for prefix in BEDROCK_CRI_REGIONS.keys():
+            assert prefix in BEDROCK_INFERENCE_PROFILE_PREFIXES, (
+                f"{prefix!r} in BEDROCK_CRI_REGIONS but not in tuple — out of sync"
+            )
