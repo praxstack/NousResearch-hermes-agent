@@ -1350,6 +1350,80 @@ class TestIsAnthropicBedrockModel:
         assert is_anthropic_bedrock_model("au.anthropic.claude-sonnet-4-6") is True
 
 
+class TestBedrockSamplingParamGuard:
+    """Code review P1-D regression tests (2026-05-24).
+
+    The Bedrock _bedrock_forbids_sampling_params guard must drop
+    temperature/top_p/top_k for every Claude 4.7+ family that AWS
+    Bedrock 400s on. Previously the substring tuple was just
+    ('claude-opus-4-7', 'claude-opus-4.7') and missed Opus 4.8 / 4.9 /
+    5.x / Sonnet 5.x — Bedrock would have rejected those calls with
+    'temperature is deprecated for this model' once Anthropic ships them.
+
+    Fix: delegate to _is_claude_4_7_or_later() which covers the full
+    surgical model list. Both callers now stay in sync automatically.
+    """
+
+    def test_opus_4_7_forbids_sampling(self):
+        from agent.bedrock_adapter import _bedrock_forbids_sampling_params
+        assert _bedrock_forbids_sampling_params("claude-opus-4-7") is True
+        assert _bedrock_forbids_sampling_params("us.anthropic.claude-opus-4-7-v1:0") is True
+        assert _bedrock_forbids_sampling_params("global.anthropic.claude-opus-4-7-v1:0") is True
+
+    def test_future_4_x_models_forbid_sampling(self):
+        """Future-proofing: Opus 4.8 / 4.9 / 5 / Sonnet 5 all expected to reject."""
+        from agent.bedrock_adapter import _bedrock_forbids_sampling_params
+        assert _bedrock_forbids_sampling_params("claude-opus-4-8") is True
+        assert _bedrock_forbids_sampling_params("claude-opus-4-9") is True
+        assert _bedrock_forbids_sampling_params("claude-opus-5") is True
+        assert _bedrock_forbids_sampling_params("claude-sonnet-5") is True
+        assert _bedrock_forbids_sampling_params("us.anthropic.claude-opus-4-8-v1:0") is True
+
+    def test_4_6_and_earlier_still_allow_sampling(self):
+        """Opus 4.6 / Sonnet 4.6 are gated by _bedrock_forbids_temp_and_top_p_together,
+        not by _bedrock_forbids_sampling_params. The latter must return False for them.
+        """
+        from agent.bedrock_adapter import _bedrock_forbids_sampling_params
+        assert _bedrock_forbids_sampling_params("claude-opus-4-6") is False
+        assert _bedrock_forbids_sampling_params("claude-sonnet-4-6") is False
+        assert _bedrock_forbids_sampling_params("claude-sonnet-4-5") is False
+        assert _bedrock_forbids_sampling_params("claude-haiku-4-5") is False
+
+    def test_non_claude_passes_through(self):
+        """Non-Claude models on Bedrock (Nova, DeepSeek, Llama) must allow sampling."""
+        from agent.bedrock_adapter import _bedrock_forbids_sampling_params
+        assert _bedrock_forbids_sampling_params("amazon.nova-pro-v1:0") is False
+        assert _bedrock_forbids_sampling_params("us.deepseek.r1-v1:0") is False
+        assert _bedrock_forbids_sampling_params("meta.llama-3-70b-instruct-v1:0") is False
+
+    def test_helper_consistency_with_thinking_gate(self):
+        """The sampling guard MUST cover the same set as _is_claude_4_7_or_later
+        (used for adaptive-thinking schema gating). Diverging coverage would
+        mean a model rejects sampling but doesn't get adaptive thinking — or
+        vice versa, both buggy.
+        """
+        from agent.bedrock_adapter import (
+            _bedrock_forbids_sampling_params,
+            _is_claude_4_7_or_later,
+        )
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-4-9",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "us.anthropic.claude-opus-4-7-v1:0",
+            "claude-opus-4-6",
+            "claude-sonnet-4-5",
+            "amazon.nova-pro-v1:0",
+        ]:
+            assert _bedrock_forbids_sampling_params(model) == _is_claude_4_7_or_later(model), (
+                f"Sampling guard / thinking gate diverge on {model!r} — "
+                f"forbids_sampling={_bedrock_forbids_sampling_params(model)}, "
+                f"is_4_7_or_later={_is_claude_4_7_or_later(model)}"
+            )
+
+
 class TestEmptyTextBlockFix:
     """Test that empty text blocks are replaced with space placeholders."""
 
