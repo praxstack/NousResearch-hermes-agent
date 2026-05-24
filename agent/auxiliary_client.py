@@ -3601,12 +3601,9 @@ def resolve_provider_client(
                 # respect ``bedrock.region`` because they're resolved via
                 # ``model_fallback`` calling us with an ``explicit_model``
                 # whose CRI prefix matches what the user configured.
-                _cri_region_map = {
-                    "us.": "us-east-1",
-                    "eu.": "eu-north-1",
-                    "jp.": "ap-northeast-3",
-                    "au.": "ap-southeast-2",
-                }
+                # Single source of truth: agent.bedrock_adapter.BEDROCK_CRI_REGIONS
+                # (P1-C, 2026-05-24 — was duplicated as a local dict literal).
+                from agent.bedrock_adapter import BEDROCK_CRI_REGIONS as _cri_region_map
                 _model_lower = final_model.lower()
                 for _prefix, _expected_region in _cri_region_map.items():
                     if _model_lower.startswith(_prefix):

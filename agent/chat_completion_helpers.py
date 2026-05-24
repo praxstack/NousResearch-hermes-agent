@@ -1038,12 +1038,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 agent._bedrock_region = _m.group(1)
             else:
                 # Fall back to CRI prefix if base_url didn't encode the region.
-                _cri_region_map = {
-                    "us.": "us-east-1",
-                    "eu.": "eu-north-1",
-                    "jp.": "ap-northeast-3",
-                    "au.": "ap-southeast-2",
-                }
+                # Single source of truth: agent.bedrock_adapter.BEDROCK_CRI_REGIONS
+                # (P1-C, 2026-05-24 — was a duplicate dict literal).
+                from agent.bedrock_adapter import BEDROCK_CRI_REGIONS as _cri_region_map
                 _ml = fb_model.lower()
                 for _pfx, _reg in _cri_region_map.items():
                     if _ml.startswith(_pfx):
