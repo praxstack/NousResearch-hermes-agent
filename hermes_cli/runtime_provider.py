@@ -1617,22 +1617,16 @@ def resolve_runtime_provider(
             # Regional prefix based on configured region
             region_lower = region.lower()
             # GovCloud + China partitions do not support cross-region inference
-            # profiles (no `us-gov.` / `cn.` prefixes exist in AWS Bedrock).
+            # Forward CRI dispatch: region → prefix. Single source of truth in
+            # bedrock_adapter.cri_prefix_for_region (P1-B + P1-C, 2026-05-24).
+            from agent.bedrock_adapter import cri_prefix_for_region
+            prefix = cri_prefix_for_region(region_lower)
+            # GovCloud + China: no inference profiles exist for these partitions.
             # Return the bare model id so boto3 / the SDK dispatch to the
             # partition's native endpoint without an invalid prefix.
-            if region_lower.startswith("us-gov-") or region_lower.startswith("cn-"):
+            if prefix is None:
                 return model_id
-            if region_lower.startswith("us-"):
-                return f"us.{base_id}{suffix}"
-            elif region_lower.startswith("eu-"):
-                return f"eu.{base_id}{suffix}"
-            elif region_lower.startswith("ap-northeast-1") or region_lower.startswith("ap-northeast-2") or region_lower.startswith("ap-northeast-3"):
-                return f"jp.{base_id}{suffix}"
-            elif region_lower.startswith("ap-"):
-                return f"apac.{base_id}{suffix}"
-            elif region_lower.startswith("au-") or region_lower.startswith("ap-southeast-2"):
-                return f"au.{base_id}{suffix}"
-            return model_id  # Region not supported for CRI — fallback to bare
+            return f"{prefix}{base_id}{suffix}"
 
         effective_model = _apply_inference_prefix(_current_model, region)
 
