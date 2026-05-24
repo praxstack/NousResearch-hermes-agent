@@ -480,6 +480,15 @@ _AWS_CREDENTIAL_ENV_VARS = [
 ]
 
 _AWS_ENV_MASK_FOR_API_KEY = (
+    # First entry: the bearer token itself — we OWN this for the duration of
+    # the SDK call (set inside the contextmanager) and the contextmanager
+    # restores prior state on exit. Including it in the mask is what makes
+    # api_key auth NOT leak the token to other concurrent threads / pooled
+    # gateway processes (Code review P1-A, 2026-05-24).
+    "AWS_BEARER_TOKEN_BEDROCK",
+    # Remaining entries are competing auth sources that must NOT be visible
+    # to boto3 during a bearer-token call (boto3 picks the first env var it
+    # finds; explicit-key pair would override our bearer token).
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
