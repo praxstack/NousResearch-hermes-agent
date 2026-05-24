@@ -294,6 +294,21 @@ def check_via_pypi() -> Optional[int]:
         return 1 if latest != VERSION else 0
 
 
+def _local_head_short(repo_dir: Path) -> Optional[str]:
+    """Return the local HEAD short hash, or None if not in a git checkout."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=8", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+            cwd=str(repo_dir),
+        )
+        if result.returncode == 0:
+            return (result.stdout or "").strip() or None
+    except Exception:
+        return None
+    return None
+
+
 def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
@@ -303,7 +318,14 @@ def check_for_updates() -> Optional[int]:
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
-    the check failed or doesn't apply. Cached for 6 hours.
+    the check failed or doesn't apply.
+
+    Cache invalidation (Prax custom 2026-05-24, 'banner-truth-after-update'):
+      The cache is keyed on (timestamp, embedded_rev, local_head). It expires
+      on EITHER (a) 6 hours elapsed, OR (b) local HEAD changed since last
+      cache write. (b) makes every TUI start show truth IMMEDIATELY after a
+      local rebase/pull/update — without re-running git ls-remote on every
+      session start (which would hit GitHub rate limits at 50-100 starts/day).
     """
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
@@ -328,20 +350,34 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check. The version guard matters for pip installs:
-    # `check_via_pypi()` compares against VERSION, so a `pip install --upgrade`
-    # changes VERSION but leaves rev unchanged (both None), and without this
-    # the stale "behind" count would survive the upgrade for up to 6h. See #34491.
+    # Resolve repo_dir up-front so we can read local HEAD even on cache hit.
+    repo_dir = Path(__file__).parent.parent.resolve()
+    if not (repo_dir / ".git").exists():
+        repo_dir = hermes_home / "hermes-agent"
+    has_local_git = (repo_dir / ".git").exists()
+    local_head = _local_head_short(repo_dir) if has_local_git else None
+
+    # Read cache — invalidate if the embedded rev, installed version, OR local
+    # HEAD has changed since the last check. The version guard matters for pip
+    # installs: `check_via_pypi()` compares against VERSION, so a
+    # `pip install --upgrade` changes VERSION but leaves rev unchanged (both
+    # None); without it the stale "behind" count would survive the upgrade for
+    # up to 6h (see #34491). The local_head guard (Prax custom) makes every TUI
+    # start show truth IMMEDIATELY after a local rebase/pull/update.
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
-            if (
-                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-                and cached.get("rev") == embedded_rev
-                and cached.get("ver") == VERSION
-            ):
+            cache_age_ok = now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
+            embedded_rev_match = cached.get("rev") == embedded_rev
+            ver_match = cached.get("ver") == VERSION
+            # cache invalid if local HEAD has moved (pull/rebase/update busts cache)
+            local_head_match = (
+                cached.get("local_head") == local_head
+                if has_local_git
+                else True
+            )
+            if cache_age_ok and embedded_rev_match and ver_match and local_head_match:
                 return cached.get("behind")
     except Exception:
         pass
@@ -352,18 +388,19 @@ def check_for_updates() -> Optional[int]:
         # Prefer the running code's location over the profile-scoped path.
         # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
         # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
+        if not has_local_git:
             behind = check_via_pypi()
         else:
             behind = _check_via_local_git(repo_dir)
 
     try:
-        cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
-        )
+        cache_file.write_text(json.dumps({
+            "ts": now,
+            "behind": behind,
+            "rev": embedded_rev,
+            "ver": VERSION,
+            "local_head": local_head,
+        }))
     except Exception:
         pass
 
