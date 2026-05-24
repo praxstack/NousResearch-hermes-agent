@@ -1351,6 +1351,35 @@ class TestBuildAnthropicKwargs:
         assert _forbids_sampling_params("claude-opus-4-6") is False
         assert _forbids_sampling_params("claude-sonnet-4-5") is False
 
+    def test_forbids_sampling_params_covers_4_7_through_5_x(self):
+        """Code review P1-D regression test (2026-05-24): the guard must
+        match every Claude family that's expected to deprecate sampling
+        params (4.7 / 4.8 / 4.9 / Opus 5.x / Sonnet 5.x).
+
+        Before the fix, the substring tuple was just ("4-7", "4.7") which
+        would let temperature/top_p/top_k leak through to Opus 4.8 and
+        beyond; the wire would reject with "deprecated for this model".
+        """
+        from agent.anthropic_adapter import _forbids_sampling_params
+        # Currently-shipping models
+        assert _forbids_sampling_params("claude-opus-4-7") is True
+        assert _forbids_sampling_params("anthropic/claude-opus-4-7") is True
+        # Future-shipping models that also reject sampling
+        assert _forbids_sampling_params("claude-opus-4-8") is True
+        assert _forbids_sampling_params("claude-opus-4-9") is True
+        assert _forbids_sampling_params("claude-opus-5") is True
+        assert _forbids_sampling_params("claude-opus-5-2") is True
+        assert _forbids_sampling_params("claude-sonnet-5") is True
+        assert _forbids_sampling_params("claude-sonnet-5-1") is True
+        # Models that still accept sampling
+        assert _forbids_sampling_params("claude-opus-4-6") is False
+        assert _forbids_sampling_params("claude-sonnet-4-6") is False
+        assert _forbids_sampling_params("claude-sonnet-4-5") is False
+        assert _forbids_sampling_params("claude-haiku-4-5") is False
+        # Non-Claude (sanity)
+        assert _forbids_sampling_params("gpt-4o") is False
+        assert _forbids_sampling_params("gemini-2-5-pro") is False
+
     def test_supports_fast_mode_predicate(self):
         """Fast mode is Opus 4.6 only — Opus 4.7 and others must be excluded."""
         from agent.anthropic_adapter import _supports_fast_mode
