@@ -233,8 +233,24 @@ class TestBuildAnthropicClient:
 
 
 class TestBuildAnthropicBedrockClient:
-    def test_api_key_mode_passes_bedrock_api_key(self):
+    def test_api_key_mode_sets_bearer_token_in_env_not_kwargs(self, monkeypatch):
+        """anthropic>=0.86 rejects api_key= on AnthropicBedrock. Production
+        sets AWS_BEARER_TOKEN_BEDROCK in os.environ for the duration of the
+        SDK call instead. (Was originally asserting kwargs['api_key'] which
+        contradicted production — fixed 2026-05-24 alongside P1-A.)
+        """
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        observed_token = {}
+
+        def _capture(*args, **kwargs):
+            # Record the bearer-token state at the moment AnthropicBedrock
+            # is constructed, so we can prove it's set inside the call.
+            import os as _os
+            observed_token["value"] = _os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+            return MagicMock()
+
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            mock_sdk.AnthropicBedrock = MagicMock(side_effect=_capture)
             build_anthropic_bedrock_client(
                 "us-east-1",
                 auth_config={
@@ -245,9 +261,57 @@ class TestBuildAnthropicBedrockClient:
             )
 
         kwargs = mock_sdk.AnthropicBedrock.call_args[1]
-        assert kwargs["api_key"] == "absk-test-token"
+        assert "api_key" not in kwargs, (
+            "AnthropicBedrock(api_key=...) is rejected by anthropic>=0.86; "
+            "production must set AWS_BEARER_TOKEN_BEDROCK in env instead"
+        )
         assert kwargs["aws_region"] == "us-east-1"
         assert "aws_profile" not in kwargs
+        # Bearer token was visible to boto3 during the SDK call
+        assert observed_token["value"] == "absk-test-token"
+
+    def test_api_key_mode_restores_env_after_sdk_call(self, monkeypatch):
+        """Code review P1-A regression test (2026-05-24). Before the fix,
+        the api_key path mutated os.environ['AWS_BEARER_TOKEN_BEDROCK']
+        unconditionally and never restored prior state. This leaked the
+        token to all other concurrent threads / pooled gateway processes
+        in the same Python interpreter. Fix: wrap the SDK call in
+        _masked_aws_env so the env var is restored on context exit.
+        """
+        # Case 1: env was unset before — must remain unset after
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            mock_sdk.AnthropicBedrock = MagicMock()
+            build_anthropic_bedrock_client(
+                "us-east-1",
+                auth_config={
+                    "method": "api_key",
+                    "api_key": "absk-call-1",
+                    "region": "us-east-1",
+                },
+            )
+        import os as _os
+        assert "AWS_BEARER_TOKEN_BEDROCK" not in _os.environ, (
+            "P1-A regression: api_key path leaked AWS_BEARER_TOKEN_BEDROCK "
+            "into env when it was unset before the call"
+        )
+
+        # Case 2: env was set to a different token before — must be restored
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "prior-token-xyz")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            mock_sdk.AnthropicBedrock = MagicMock()
+            build_anthropic_bedrock_client(
+                "us-east-1",
+                auth_config={
+                    "method": "api_key",
+                    "api_key": "absk-call-2-different",
+                    "region": "us-east-1",
+                },
+            )
+        assert _os.environ.get("AWS_BEARER_TOKEN_BEDROCK") == "prior-token-xyz", (
+            "P1-A regression: api_key path overwrote prior bearer token "
+            "and never restored it"
+        )
 
     def test_profile_mode_masks_ambient_bedrock_api_key(self, monkeypatch):
         monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "stale-absk-token")

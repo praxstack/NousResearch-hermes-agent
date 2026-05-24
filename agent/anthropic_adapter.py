@@ -950,6 +950,7 @@ def build_anthropic_bedrock_client(
     except ImportError:
         timeout = 900.0
     from agent.bedrock_adapter import (
+        _AWS_ENV_MASK_FOR_API_KEY,
         _AWS_ENV_MASK_FOR_CREDENTIALS,
         _AWS_ENV_MASK_FOR_DEFAULT_CHAIN,
         _AWS_ENV_MASK_FOR_PROFILE,
@@ -984,11 +985,14 @@ def build_anthropic_bedrock_client(
         # SDK compat: anthropic>=0.86 rejects api_key= on AnthropicBedrock.
         # The class wraps boto3, and botocore>=1.34.145 auto-discovers
         # AWS_BEARER_TOKEN_BEDROCK from the process env. We set the env
-        # var here (idempotent; .env already loaded it) so the default
-        # credential chain picks it up. No api_key= kwarg is passed.
+        # var here ONLY for the duration of the SDK call and restore prior
+        # state on exit. Without this scoping, mutating AWS_BEARER_TOKEN_BEDROCK
+        # in os.environ would leak to other concurrent threads / pooled
+        # gateway processes — see Code review P1-A (2026-05-24).
         import os as _os
-        _os.environ["AWS_BEARER_TOKEN_BEDROCK"] = auth_config["api_key"]
-        return _anthropic_sdk.AnthropicBedrock(**kwargs)
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY):
+            _os.environ["AWS_BEARER_TOKEN_BEDROCK"] = auth_config["api_key"]
+            return _anthropic_sdk.AnthropicBedrock(**kwargs)
 
     if method == "profile":
         kwargs["aws_profile"] = auth_config["profile"]
