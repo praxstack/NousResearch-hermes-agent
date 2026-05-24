@@ -187,8 +187,24 @@ _XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7")
 _ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
-# This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
-_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7")
+# This is the Opus 4.7 contract; future 4.x+ and 5.x families are expected to
+# follow it (Anthropic's deprecations are monotonic). Code review P1-D
+# (2026-05-24): was just ("4-7", "4.7"); didn't catch 4.8/4.9/5.x. The
+# expanded tuple matches the surgical model list in bedrock_adapter's
+# _is_claude_4_7_or_later() so both providers stay in sync. If a future
+# release re-allows sampling, drop the offending substring.
+_NO_SAMPLING_PARAMS_SUBSTRINGS = (
+    "claude-opus-4-7",
+    "claude-opus-4.7",
+    "claude-opus-4-8",
+    "claude-opus-4.8",
+    "claude-opus-4-9",
+    "claude-opus-4.9",
+    "claude-opus-5",
+    "claude-opus-5.",
+    "claude-sonnet-5",
+    "claude-sonnet-5.",
+)
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 
 # ── Max output token limits per Anthropic model ───────────────────────

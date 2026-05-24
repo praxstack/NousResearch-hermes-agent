@@ -428,11 +428,19 @@ def _is_claude_4_7_or_later(wire_model: str) -> bool:
 #       passed LAST (top_p preferred-dropped since temperature is more commonly
 #       set and the Anthropic adapter keeps temperature) for Opus 4.6 / Sonnet 4.6.
 #
+# Coverage for (1): any Claude 4.7 / 4.8 / 4.9 / 5.x — Anthropic's sampling-param
+# deprecations are monotonic. We delegate to `_is_claude_4_7_or_later()`
+# (already used elsewhere for adaptive-thinking-schema gating) so the
+# guard automatically picks up future model families. If Anthropic ever
+# re-allows sampling params on a future model, this is a one-line revert
+# pointing back at a substring tuple.
+# Code review P1-D (2026-05-24): was a substring tuple "claude-opus-4-7"
+# only; missed 4.8/5/etc. that `_is_claude_4_7_or_later()` also covers.
+#
 # Mirror of _forbids_sampling_params() in agent/anthropic_adapter.py. The
 # Bedrock Converse API is a separate code path — we can't just share the
 # function because anthropic_adapter uses different kwargs keys.
 # ---------------------------------------------------------------------------
-_BEDROCK_NO_SAMPLING_PARAMS_SUBSTRINGS = ("claude-opus-4-7", "claude-opus-4.7")
 _BEDROCK_NO_TEMP_AND_TOP_P_SUBSTRINGS = (
     "claude-opus-4-6",
     "claude-opus-4.6",
@@ -444,12 +452,13 @@ _BEDROCK_NO_TEMP_AND_TOP_P_SUBSTRINGS = (
 def _bedrock_forbids_sampling_params(wire_model: str) -> bool:
     """Return True if the Bedrock model rejects temperature/top_p entirely.
 
-    Opus 4.7 on Bedrock rejects any non-default temperature/top_p with a
-    ValidationException: "temperature is deprecated for this model." The
-    wire_model is the ID after :1m stripping (so both raw and 1M variants match).
+    Opus 4.7+ on Bedrock rejects any non-default temperature/top_p with a
+    ValidationException: "temperature is deprecated for this model."
+    Coverage delegated to `_is_claude_4_7_or_later()` so the guard picks
+    up Opus 4.8 / 5 / Sonnet 5 / etc. automatically. The wire_model is
+    the ID after :1m stripping (so both raw and 1M variants match).
     """
-    lower = wire_model.lower()
-    return any(v in lower for v in _BEDROCK_NO_SAMPLING_PARAMS_SUBSTRINGS)
+    return _is_claude_4_7_or_later(wire_model)
 
 
 def _bedrock_forbids_temp_and_top_p_together(wire_model: str) -> bool:
