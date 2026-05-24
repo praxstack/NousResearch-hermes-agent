@@ -4273,10 +4273,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             duration_label = snapshot["duration"]
             yolo_active = self._is_session_yolo_active()
 
+            # Region tag injected after model_short (Prax custom 2026-05-07, tiered 2026-05-24)
+            _region_frags = []
+            _region = snapshot.get("region_tag") or ""
+            if _region:
+                _region_frags = [
+                    ("class:status-bar-dim", " · "),
+                    ("class:status-bar-dim", _region),
+                ]
+
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
+                    *_region_frags,
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                 ]
@@ -4294,6 +4304,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                        *_region_frags,
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
                     ]
@@ -4329,6 +4340,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                        *_region_frags,
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
