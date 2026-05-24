@@ -292,6 +292,65 @@ BEDROCK_INFERENCE_PROFILE_PREFIXES = (
     "au.",
 )
 
+
+# ---------------------------------------------------------------------------
+# Canonical CRI prefix → AWS region map (single source of truth).
+# ---------------------------------------------------------------------------
+# Used by both directions of the dispatch:
+#   - forward (region → prefix): runtime_provider._apply_inference_prefix
+#   - reverse (prefix → region): auxiliary_client + chat_completion_helpers
+#                                fallback-region overrides
+#
+# Per AWS cross-region inference convention, each prefix has ONE canonical
+# physical region used as the entry point for that profile. Bedrock's
+# router fans out inside the partition, but the wire endpoint must point
+# at the canonical entry. The reverse map (BEDROCK_REGION_TO_CRI_PREFIX)
+# is computed below and excludes multi-region profiles whose forward
+# mapping is region-pattern-based, not 1-to-1.
+#
+# global.* and apac.* are multi-region — they live in BEDROCK_INFERENCE_PROFILE_PREFIXES
+# but NOT in this dict because they don't have a single canonical region.
+# Code review P1-B + P1-C (2026-05-24) — was previously duplicated in 3 files
+# with inconsistent logic (au-* dead branch, ap-southeast-2 ordering bug).
+BEDROCK_CRI_REGIONS = {
+    "us.": "us-east-1",
+    "eu.": "eu-north-1",
+    "jp.": "ap-northeast-3",
+    "au.": "ap-southeast-2",
+}
+
+
+def cri_prefix_for_region(region: str) -> Optional[str]:
+    """Map an AWS region to its canonical CRI prefix.
+
+    Returns None for unsupported regions. Returns 'us.', 'eu.', 'jp.', or
+    'au.' as appropriate. ap-southeast-2 → 'au.' (Sydney is the Australia
+    profile's entry, not the apac generic). Other ap-* regions → 'apac.'.
+
+    Used in both runtime_provider (forward dispatch) and reverse-derive
+    paths so behavior is consistent across the codebase.
+    """
+    if not region:
+        return None
+    region_lower = region.lower()
+    # GovCloud / China partitions: no inference profiles defined; bare modelId only
+    if region_lower.startswith("us-gov-") or region_lower.startswith("cn-"):
+        return None
+    if region_lower.startswith("us-"):
+        return "us."
+    if region_lower.startswith("eu-"):
+        return "eu."
+    # Order matters: jp / au (specific Asian regions) check BEFORE generic apac
+    if (region_lower.startswith("ap-northeast-1")
+            or region_lower.startswith("ap-northeast-2")
+            or region_lower.startswith("ap-northeast-3")):
+        return "jp."
+    if region_lower.startswith("ap-southeast-2"):
+        return "au."
+    if region_lower.startswith("ap-"):
+        return "apac."
+    return None
+
 # ---------------------------------------------------------------------------
 # 1M-context variant support (Cline parity — see their bedrock.ts).
 # ---------------------------------------------------------------------------
