@@ -1,4 +1,24 @@
-"""Tests for the Bedrock patch guard (bedrock_guard.py)."""
+"""Tests for the Bedrock patch guard (bedrock_guard.py).
+
+NOTE: These tests exercise the bedrock-guard dotfiles project at
+~/.local/lib/bedrock-guard/ (symlinked from ~/dotfiles/bedrock-guard/).
+That tree is NOT part of Hermes — it's an out-of-tree per-user tool.
+
+Code review P1-E (2026-05-24): the previous `pytest.importorskip` here
+SILENTLY SKIPPED on every machine without bedrock-guard installed,
+hiding the fact that 421 lines of tests weren't running. This is the
+classic "tests pass because they don't actually run" failure mode.
+
+The fix: convert the silent skip to an EXPLICIT module-level
+`pytest.skip(allow_module_level=True)` with a loud reason so anyone
+viewing pytest output sees the deliberate skip, not an empty
+collection. The tests DO exercise real production paths on Prax's
+machine where bedrock-guard is installed.
+
+Long-term TODO: move these tests into the bedrock-guard repo itself
+(co-located with the code they test) so Hermes CI doesn't carry tests
+for an external project.
+"""
 from __future__ import annotations
 
 import json
@@ -8,13 +28,23 @@ from typing import Any
 
 import pytest
 
-# Make the guard dir importable. The module now lives at
+# Make the guard dir importable. The module lives at
 # ~/.local/lib/bedrock-guard/ — independent of Hermes.
 GUARD_DIR = Path.home() / ".local" / "lib" / "bedrock-guard"
+if not GUARD_DIR.exists() or not (GUARD_DIR / "bedrock_guard.py").exists():
+    pytest.skip(
+        f"bedrock-guard out-of-tree dependency not installed at {GUARD_DIR}. "
+        "These tests exercise an external dotfiles tool; they only run on "
+        "machines where bedrock-guard is installed. To install, see "
+        "~/dotfiles/bedrock-guard/. Long-term these tests belong in the "
+        "bedrock-guard repo itself (P1-E, 2026-05-24).",
+        allow_module_level=True,
+    )
+
 if str(GUARD_DIR) not in sys.path:
     sys.path.insert(0, str(GUARD_DIR))
 
-bedrock_guard = pytest.importorskip("bedrock_guard")
+import bedrock_guard  # noqa: E402  (import has to follow path injection above)
 
 
 def _make_install(tmp_path: Path, version: str, files: dict[str, str]) -> Path:
