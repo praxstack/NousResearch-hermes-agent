@@ -9,7 +9,6 @@ import os
 import shutil
 import subprocess
 import threading
-import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, List, Optional
@@ -120,8 +119,15 @@ def get_available_skills() -> Dict[str, List[str]]:
 # Update check
 # =========================================================================
 
-# Cache update check results for 6 hours to avoid repeated git fetches
-_UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
+# Prax custom 2026-05-26: filesystem cache REMOVED. The 6h cache silently
+# returned stale "behind N" counts after upstream moved, AND the threaded
+# 500ms grace in format_banner_version_label() dropped the widget entirely
+# on cold launches because git ls-remote / git fetch takes ~3.5s. Now every
+# launch does a real fetch — the prefetch thread hides the latency behind
+# tool/skill discovery, and the banner blocks up to 30s waiting for it.
+# Net cost: ~1-3s of banner-paint latency on cold launches. Net gain:
+# behind-count is always real-time and title's upstream short hash matches
+# the post-fetch origin/main.
 
 # Sentinel returned when we know an update exists but can't count commits
 # (e.g. nix-built hermes — no local git history to count against).
@@ -243,64 +249,33 @@ def check_for_updates() -> Optional[int]:
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
     the check failed or doesn't apply.
 
-    Cache invalidation (Prax custom 2026-05-24, 'banner-truth-after-update'):
-      The cache is keyed on (timestamp, embedded_rev, local_head). It expires
-      on EITHER (a) 6 hours elapsed, OR (b) local HEAD changed since last
-      cache write. (b) makes every TUI start show truth IMMEDIATELY after a
-      local rebase/pull/update — without re-running git ls-remote on every
-      session start (which would hit GitHub rate limits at 50-100 starts/day).
+    Prax custom 2026-05-26 ('banner-real-time'): NO filesystem cache.
+    Every launch does a real ``git ls-remote`` / ``git fetch origin`` so
+    the banner reflects ground truth. Latency (~1-3s on warm DNS, ~3.5s
+    cold) is hidden behind the prefetch thread which runs concurrently
+    with tool/skill discovery. The previous 6h cache was solving a
+    phantom rate-limit problem (git smart-HTTP against public repos has
+    no documented rate limit) and CAUSING two real bugs: stale
+    "behind N" counts, and silent widget-drop when the 500ms grace
+    expired before the network round-trip.
     """
-    hermes_home = get_hermes_home()
-    cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
 
-    # Resolve repo_dir up-front so we can read local HEAD even on cache hit
+    if embedded_rev:
+        return _check_via_rev(embedded_rev)
+
+    # Prefer the running code's location over the profile-scoped path.
+    # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
+    # Path(__file__) always resolves to the actual installed checkout.
     repo_dir = Path(__file__).parent.parent.resolve()
     if not (repo_dir / ".git").exists():
-        repo_dir = hermes_home / "hermes-agent"
+        repo_dir = get_hermes_home() / "hermes-agent"
     has_local_git = (repo_dir / ".git").exists()
-    local_head = _local_head_short(repo_dir) if has_local_git else None
 
-    # Read cache — invalidate if rev OR local HEAD has changed since last check
-    now = time.time()
-    try:
-        if cache_file.exists():
-            cached = json.loads(cache_file.read_text())
-            cache_age_ok = now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-            embedded_rev_match = cached.get("rev") == embedded_rev
-            # New: cache invalid if local HEAD has moved (pull/rebase/update busts cache)
-            local_head_match = (
-                cached.get("local_head") == local_head
-                if has_local_git
-                else True
-            )
-            if cache_age_ok and embedded_rev_match and local_head_match:
-                return cached.get("behind")
-    except Exception:
-        pass
+    if not has_local_git:
+        return check_via_pypi()
 
-    if embedded_rev:
-        behind = _check_via_rev(embedded_rev)
-    else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        if not has_local_git:
-            behind = check_via_pypi()
-        else:
-            behind = _check_via_local_git(repo_dir)
-
-    try:
-        cache_file.write_text(json.dumps({
-            "ts": now,
-            "behind": behind,
-            "rev": embedded_rev,
-            "local_head": local_head,
-        }))
-    except Exception:
-        pass
-
-    return behind
+    return _check_via_local_git(repo_dir)
 
 
 def _resolve_repo_dir() -> Optional[Path]:
@@ -418,8 +393,28 @@ def format_banner_version_label() -> str:
     hero art (see make_banner). Mirrors the pending ``check_for_updates``
     result without blocking — title just silently omits the segment when
     the count isn't ready yet.
+
+    Prax custom 2026-05-26 ('banner-real-time'): WAIT for the prefetch
+    thread (up to 30s) BEFORE reading origin/main short hash. Two reasons:
+      1. The prefetch's git fetch updates origin/main locally, so we want
+         it done before _git_short_hash(origin/main) runs — otherwise the
+         title shows the pre-fetch hash while the BEHIND count is computed
+         post-fetch (banner cited two different upstreams).
+      2. The 500ms grace silently dropped the BEHIND segment whenever the
+         network round-trip (~3.5s cold) was slower than 500ms, which was
+         every cold launch.
     """
     base = f"Hermes Agent v{VERSION} ({RELEASE_DATE})"
+
+    # Wait for prefetched update check FIRST so origin/main ref is fresh
+    # before we read its short hash. The prefetch thread has been running
+    # since main.py:1724; by the time make_banner() hits this function
+    # post-tool-discovery the result is usually already there.
+    try:
+        behind = get_update_result(timeout=30.0)
+    except Exception:
+        behind = None
+
     state = get_git_banner_state()
     if not state:
         label = base
@@ -436,18 +431,6 @@ def format_banner_version_label() -> str:
                 f"(+{ahead} carried {carried_word})"
             )
 
-    # Prax custom: peek at prefetched update result with a small budget so
-    # cold-cache runs (first ``hermes`` after ~6h) still catch the count.
-    # ``check_for_updates`` takes ~3.6s when it has to hit the network
-    # (``git ls-remote origin main``); we'd rather give it a 500 ms grace
-    # than silently omit the widget. Banner is only printed once per launch,
-    # so a worst-case 500 ms pause is invisible next to skill/tool discovery.
-    # When the fetch is slower than 500 ms, we still fall through and the
-    # widget stays silent — same behaviour as before.
-    try:
-        behind = get_update_result(timeout=0.5)
-    except Exception:
-        behind = None
     if behind is not None and behind != 0:
         if behind > 0:
             commits_word = "COMMIT" if behind == 1 else "COMMITS"
@@ -466,17 +449,37 @@ _update_check_done = threading.Event()
 
 
 def prefetch_update_check():
-    """Kick off update check in a background daemon thread."""
+    """Kick off update check in a background daemon thread.
+
+    Prax custom 2026-05-26: try/finally guarantees the Event gets set even
+    if check_for_updates() raises. Without this, a crashing prefetch
+    thread leaves the Event un-set forever — every subsequent call to
+    get_update_result() then blocks the full timeout (30s post-cache-strip)
+    with no widget rendered. Caught by the smoke+stress harness AUDIT-8.
+    """
     def _run():
         global _update_result
-        _update_result = check_for_updates()
-        _update_check_done.set()
+        try:
+            _update_result = check_for_updates()
+        except Exception:
+            # Swallow the error — banner is best-effort, never break the prompt.
+            # Logging here would compete with rich's Live display for stderr,
+            # so we silently fall through. _update_result stays None and
+            # the BEHIND widget is omitted, same as a clean None return.
+            _update_result = None
+        finally:
+            _update_check_done.set()
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
 
-def get_update_result(timeout: float = 0.5) -> Optional[int]:
-    """Get result of prefetched check. Returns None if not ready."""
+def get_update_result(timeout: float = 30.0) -> Optional[int]:
+    """Get result of prefetched check. Returns None if not ready.
+
+    Prax custom 2026-05-26: default timeout bumped 0.5s → 30s. Network
+    round-trips against GitHub take ~1-3s warm, ~3.5s cold. The previous
+    500ms ceiling silently dropped the BEHIND widget on every cold launch.
+    """
     _update_check_done.wait(timeout=timeout)
     return _update_result
 
@@ -719,7 +722,12 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
 
     # Update check — use prefetched result if available
     try:
-        behind = get_update_result(timeout=0.5)
+        # Prax custom 2026-05-26: format_banner_version_label() already
+        # blocked up to 30s for the prefetch above. By the time we reach
+        # this right-column update line, the result is in memory — the
+        # 30s ceiling here is just a safety net for race-condition paths
+        # where this is called before the title was rendered.
+        behind = get_update_result(timeout=30.0)
         if behind is not None and behind != 0:
             from hermes_cli.config import get_managed_update_command, recommended_update_command
             if behind > 0:
@@ -779,8 +787,11 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     # prefetch thread has already been running since early in main.py, so by
     # the time make_banner() is called post-tool-discovery the result is
     # usually ready; the grace only matters on the first cold-cache launch.
+    # Prax custom 2026-05-26: format_banner_version_label() already blocked
+    # up to 30s for the prefetch — by the time we render this footer, the
+    # result is in memory. The 30s here is just a safety ceiling.
     try:
-        _behind = get_update_result(timeout=0.5)
+        _behind = get_update_result(timeout=30.0)
     except Exception:
         _behind = None
     if _behind is not None and _behind != 0:
