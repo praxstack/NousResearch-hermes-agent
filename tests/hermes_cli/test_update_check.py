@@ -16,77 +16,22 @@ def test_version_string_no_v_prefix():
     assert not __version__.startswith("v"), f"__version__ should not start with 'v', got {__version__!r}"
 
 
-def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
-    from hermes_cli.banner import check_for_updates
-    from hermes_cli import __version__
-
-    # Create a fake git repo and fresh cache
-    repo_dir = tmp_path / "hermes-agent"
-    repo_dir.mkdir()
-    (repo_dir / ".git").mkdir()
-
-    cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
-        result = check_for_updates()
-
-    assert result == 3
-    mock_run.assert_not_called()
-
-
-def test_check_for_updates_invalidates_on_version_change(tmp_path, monkeypatch):
-    """A fresh cache from a different installed version must be re-checked, not reused.
-
-    Regression for #34491: after `pip install --upgrade`, VERSION changes but the
-    cache's 6h TTL hadn't expired and rev was unchanged (both None), so the stale
-    'behind' count survived the upgrade. The version guard forces a recheck.
+def test_check_for_updates_no_filesystem_cache(tmp_path, monkeypatch):
+    """Prax custom 2026-05-26: filesystem cache REMOVED. Even if a stale
+    cache file exists on disk from before the rip-out, check_for_updates
+    must ignore it and run the real git commands.
     """
-    import hermes_cli.banner as banner
-
-    # No local git checkout -> the PyPI path is exercised (pip-install class).
-    fake_banner = tmp_path / "hermes_cli" / "banner.py"
-    fake_banner.parent.mkdir(parents=True, exist_ok=True)
-    fake_banner.touch()
-    monkeypatch.setattr(banner, "__file__", str(fake_banner))
-
-    # Fresh (within TTL) cache that says "behind", but stamped with an OLD version.
-    cache_file = tmp_path / ".update_check"
-    cache_file.write_text(
-        json.dumps({"ts": time.time(), "behind": 1, "rev": None, "ver": "0.0.1-old"})
-    )
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("HERMES_REVISION", raising=False)
-    with patch("hermes_cli.banner.subprocess.run") as mock_run, \
-         patch("hermes_cli.banner.check_via_pypi", return_value=0) as mock_pypi:
-        result = banner.check_for_updates()
-
-    # Stale-version cache rejected -> fresh check ran -> up-to-date result.
-    assert result == 0
-    mock_pypi.assert_called_once()
-    mock_run.assert_not_called()
-
-    # Cache rewritten with the current installed version.
-    written = json.loads(cache_file.read_text())
-    assert written["ver"] == banner.VERSION
-
-
-def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
-    """When cache is expired, check_for_updates should call git fetch."""
     from hermes_cli.banner import check_for_updates
 
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
 
-    # Write an expired cache (timestamp far in the past)
+    # Lay down a stale cache that says "behind: 99" — this should be ignored
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": 0, "behind": 1}))
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 99}))
 
-    mock_result = MagicMock(returncode=0, stdout="5\n")
+    mock_result = MagicMock(returncode=0, stdout="7\n")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
@@ -332,6 +277,36 @@ def test_prefetch_non_blocking():
         # Wait for the background thread to finish
         banner._update_check_done.wait(timeout=5)
         assert banner._update_result == 5
+
+
+def test_prefetch_sets_event_even_when_check_raises():
+    """Prax custom 2026-05-26: regression test for AUDIT-8 latent bug.
+
+    If check_for_updates() raises, the prefetch thread used to crash without
+    setting _update_check_done, which then made every get_update_result()
+    call block the full timeout (30s) with no widget.
+    """
+    import hermes_cli.banner as banner
+
+    # Reset module state
+    banner._update_result = None
+    banner._update_check_done = threading.Event()
+
+    with patch.object(banner, "check_for_updates",
+                      side_effect=RuntimeError("simulated failure")):
+        banner.prefetch_update_check()
+        # Wait briefly for the thread to crash
+        event_set = banner._update_check_done.wait(timeout=2.0)
+
+    assert event_set, (
+        "_update_check_done must be set even when check_for_updates raises "
+        "— otherwise format_banner_version_label() blocks the full 30s on "
+        "every call after a crashed prefetch."
+    )
+    # And the result must be None (not stale), so the widget cleanly omits
+    assert banner._update_result is None, (
+        f"_update_result should be None after a crash, got {banner._update_result!r}"
+    )
 
 
 def test_invalidate_update_cache_clears_all_profiles(tmp_path):
