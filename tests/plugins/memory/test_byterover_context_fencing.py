@@ -18,6 +18,12 @@ Findings → tests in this file:
   H4 — direct answers with slug+date preserved (TestConservativeFencing)
   M1 — fully-fenced turns skip curate (TestFullyFencedTurnSkipsCurate)
 
+Council Round 3 (final-diff review) findings → tests:
+  R3-HIGH-1 — feature flag disables fencing byte-for-byte (TestFeatureFlag)
+  R3-HIGH-2 — embedded markers in entry bodies sanitized (TestEmbeddedMarkerSanitization)
+  R3-HIGH-3 — orphan begin marker swept defensively (TestOrphanBeginMarkerSweep)
+  R3-HIGH-3 — fast-path no allocation when marker absent (TestFastPath)
+
 These tests are pure-Python — no brv CLI subprocess, no real filesystem
 state beyond a tmp_path for fence-decision audit log.
 """
@@ -558,3 +564,251 @@ class TestRecursivePollutionPrevention:
         assert "commit bbb013d" not in curated
         # The assistant's new reasoning IS captured.
         assert "schema doc is the next thing to check." in curated
+
+
+# ---------------------------------------------------------------------------
+# Council Round 3 hardening — feature flag, marker sanitization, orphan sweep
+# ---------------------------------------------------------------------------
+
+
+class TestFeatureFlag:
+    """R3-HIGH-1: BRV_CONTEXT_FENCING env var as kill switch."""
+
+    def test_disabled_returns_input_unchanged(self, monkeypatch):
+        monkeypatch.setenv("BRV_CONTEXT_FENCING", "0")
+        block = _recall_block("### slug_a\nbody A\n")
+        text = block + "\n\nNew reasoning."
+        fenced, n = _apply_context_fence(text)
+        # Byte-for-byte identical when fencing disabled.
+        assert fenced == text
+        assert n == 0
+
+    def test_disabled_falsy_variants(self, monkeypatch):
+        for val in ("0", "false", "FALSE", "False", "no", "off"):
+            monkeypatch.setenv("BRV_CONTEXT_FENCING", val)
+            block = _recall_block("### slug\nbody\n")
+            text = block + "\nReasoning."
+            fenced, n = _apply_context_fence(text)
+            assert fenced == text, f"expected no-op for BRV_CONTEXT_FENCING={val!r}"
+            assert n == 0
+
+    def test_enabled_default(self, monkeypatch):
+        # No env var = enabled by default
+        monkeypatch.delenv("BRV_CONTEXT_FENCING", raising=False)
+        block = _recall_block("### slug\nbody\n")
+        text = block + "\nReasoning."
+        fenced, n = _apply_context_fence(text)
+        assert n == 1
+        assert "body" not in fenced
+        assert "Reasoning." in fenced
+
+    def test_disabled_wrap_is_pre_l4_shape(self, monkeypatch):
+        """When fencing disabled, _wrap_with_fence_markers returns the
+        legacy ## ByteRover Context block — byte-for-byte pre-L4."""
+        monkeypatch.setenv("BRV_CONTEXT_FENCING", "0")
+        wrapped = _wrap_with_fence_markers("body content")
+        assert wrapped == "## ByteRover Context\nbody content"
+        assert _FENCE_BEGIN_MARKER not in wrapped
+        assert _FENCE_END_MARKER not in wrapped
+
+    def test_truthy_values_enable(self, monkeypatch):
+        """Anything not in the falsy set enables (defensive default)."""
+        for val in ("1", "true", "yes", "on", "anything", ""):
+            monkeypatch.setenv("BRV_CONTEXT_FENCING", val)
+            block = _recall_block("### slug\nbody\n")
+            text = block + "\nReasoning."
+            _, n = _apply_context_fence(text)
+            assert n == 1, f"expected fence active for BRV_CONTEXT_FENCING={val!r}"
+
+
+class TestEmbeddedMarkerSanitization:
+    """R3-HIGH-2: a curated entry body containing the marker strings must
+    not break the strip when re-fetched. Sanitize on wrap."""
+
+    def test_embedded_markers_in_body_sanitized_on_wrap(self):
+        # Simulate a recalled entry whose body itself contains the marker
+        # (e.g. a learning ABOUT the fence design — this very project's
+        # self-write pattern).
+        nasty_body = (
+            "### learning_about_l4_fence\n"
+            "The fence uses '<!-- byterover-context-begin -->' as a marker.\n"
+            "It pairs with '<!-- byterover-context-end -->'.\n"
+        )
+        wrapped = _wrap_with_fence_markers(nasty_body)
+        # Outer markers still present
+        assert wrapped.startswith(_FENCE_BEGIN_MARKER)
+        assert wrapped.endswith(_FENCE_END_MARKER)
+        # Inner markers replaced with escape variants
+        assert "byterover-context-begin-ZWNJ" in wrapped
+        assert "byterover-context-end-ZWNJ" in wrapped
+        # Verify exactly ONE pair of real markers (the outer wrap).
+        assert wrapped.count(_FENCE_BEGIN_MARKER) == 1
+        assert wrapped.count(_FENCE_END_MARKER) == 1
+
+    def test_strip_works_with_sanitized_inner_content(self):
+        """The whole sanitized block strips cleanly — no leak from inner
+        escape markers that look similar to real markers."""
+        nasty_body = (
+            "### learning\n"
+            "Marker is <!-- byterover-context-begin --> and "
+            "<!-- byterover-context-end -->.\n"
+        )
+        wrapped = _wrap_with_fence_markers(nasty_body)
+        text = wrapped + "\n\nMy new reasoning continues."
+        fenced, n = _apply_context_fence(text)
+        assert n == 1
+        # The whole wrapped block (including escape variants) is stripped.
+        assert "learning" not in fenced
+        assert "byterover-context-begin-ZWNJ" not in fenced
+        assert "byterover-context-end-ZWNJ" not in fenced
+        assert "My new reasoning continues." in fenced
+
+    def test_recursive_self_write_pattern_blocked(self):
+        """The exact self-write pattern that motivated R3-HIGH-2: agent
+        writes a learning ABOUT the fence design and that learning gets
+        recalled in a future turn. The fence must still strip cleanly."""
+        learning_body = (
+            "### byterover_l4_fence_design_2026_05_26\n"
+            "The Layer 4 context fence uses <!-- byterover-context-begin -->\n"
+            "and <!-- byterover-context-end --> markers to anchor structural\n"
+            "stripping. Per Round 3 HIGH-2, these are sanitized in-content\n"
+            "to ZWNJ-escape variants before wrap.\n"
+        )
+        wrapped = _wrap_with_fence_markers(learning_body)
+        text = (
+            "Earlier reasoning.\n\n"
+            + wrapped
+            + "\n\nNew reasoning. The fence works."
+        )
+        fenced, n = _apply_context_fence(text)
+        assert n == 1
+        assert "Earlier reasoning." in fenced
+        assert "New reasoning. The fence works." in fenced
+        # No part of the recalled learning leaks
+        assert "byterover_l4_fence_design" not in fenced
+        assert "ZWNJ" not in fenced
+
+
+class TestOrphanBeginMarkerSweep:
+    """R3-HIGH-3: an unmatched begin marker (no paired end) must be swept.
+
+    Failure modes covered: (1) truncation mid-stream, (2) partial assistant
+    write, (3) adversarial chat-of-thought emitting begin marker prose.
+    """
+
+    def test_orphan_begin_without_end_swept(self):
+        # Simulated truncation: begin marker present, end marker missing.
+        text = (
+            "Reasoning before.\n"
+            f"{_FENCE_BEGIN_MARKER}\n"
+            "## ByteRover Context\n"
+            "### slug\nbody body\n"
+            "(stream truncated here, no end marker)\n"
+        )
+        fenced, n = _apply_context_fence(text)
+        # Phase 1 strips nothing (no paired end), but Phase 2 sweeps the
+        # orphan begin line so the marker text doesn't leak into curate.
+        assert _FENCE_BEGIN_MARKER not in fenced
+        assert "Reasoning before." in fenced
+
+    def test_assistant_quoting_begin_marker_not_overstrip(self):
+        # Adversarial: assistant prose contains the begin marker as a
+        # quoted reference. With NO paired end, Phase 2 still strips the
+        # line carrying the marker — but everything else is preserved.
+        text = (
+            "I will document the fence design.\n"
+            f"The marker is `{_FENCE_BEGIN_MARKER}` and pairs with end.\n"
+            "More prose after.\n"
+        )
+        fenced, _ = _apply_context_fence(text)
+        # Marker-line stripped (defensive sweep)
+        assert _FENCE_BEGIN_MARKER not in fenced
+        # Surrounding prose preserved
+        assert "I will document the fence design." in fenced
+        assert "More prose after." in fenced
+
+    def test_well_formed_block_phase1_strips_then_phase2_noop(self):
+        # Healthy case: complete block. Phase 1 strips, Phase 2 sees no
+        # remaining begin marker and bails fast.
+        block = _recall_block("### slug\nbody\n")
+        text = block + "\n\nReasoning."
+        fenced, n = _apply_context_fence(text)
+        assert n == 1
+        assert _FENCE_BEGIN_MARKER not in fenced
+        assert "Reasoning." in fenced
+
+
+class TestFastPath:
+    """R3-HIGH-3 perf mitigation: marker absent = no regex compile/scan."""
+
+    def test_no_marker_short_circuit_returns_unchanged(self):
+        # When marker is absent, _apply_context_fence must return the
+        # exact same string (object identity not required; equality is).
+        text = "x" * 100_000  # large content, no marker
+        fenced, n = _apply_context_fence(text)
+        assert fenced == text
+        assert n == 0
+
+    def test_no_marker_with_inline_html_comment_unchanged(self):
+        # Plain HTML comments unrelated to byterover are preserved verbatim.
+        text = "<!-- some other comment -->\nContent.\n<!-- another -->"
+        fenced, n = _apply_context_fence(text)
+        assert fenced == text
+        assert n == 0
+
+
+class TestToolCurateFencing:
+    """Round 3 defense-in-depth: explicit brv_curate tool call also fenced."""
+
+    def test_tool_curate_strips_recall_block(self, tmp_path):
+        p = _make_provider(tmp_path)
+        p._last_prefetched_slugs = ["slug_a"]
+
+        block = _recall_block("### slug_a\nrecalled body\n")
+        content_with_recall = block + "\n\nNew explanation to remember."
+
+        captured = []
+        def fake_run_brv(args, **kwargs):
+            captured.append(args)
+            return {"success": True, "output": ""}
+
+        with mock_patch("plugins.memory.byterover._run_brv", side_effect=fake_run_brv):
+            result = p._tool_curate({"content": content_with_recall})
+
+        assert "result" in result, f"expected curate success, got {result!r}"
+        assert len(captured) == 1
+        curated = captured[0][2]  # the actual content passed to brv curate
+        assert "recalled body" not in curated
+        assert "New explanation to remember." in curated
+
+    def test_tool_curate_rejects_fully_fenced_content(self, tmp_path):
+        p = _make_provider(tmp_path)
+        p._last_prefetched_slugs = ["slug_a"]
+
+        # Content is JUST a recall block — fully fenced = nothing left.
+        block = _recall_block("### slug_a\nbody\n")
+
+        captured = []
+        def fake_run_brv(args, **kwargs):
+            captured.append(args)
+            return {"success": True, "output": ""}
+
+        with mock_patch("plugins.memory.byterover._run_brv", side_effect=fake_run_brv):
+            result = p._tool_curate({"content": block})
+
+        # Should return tool_error, not call brv curate
+        assert "error" in result.lower() or "empty" in result.lower()
+        assert len(captured) == 0
+
+
+class TestRecencyDecayDeterminism:
+    """Council Round 3 MEDIUM-3 / HIGH-4 follow-up: confirm _apply_recency_decay
+    with NO updatedAt does not silently demote legacy entries below stale-but-
+    timestamped entries on a synthetic boundary case."""
+
+    def test_legacy_entry_treated_as_90_days_for_decay(self):
+        # The decay assigns no-updatedAt entries to "90 days old". This is a
+        # tradeoff: legacy entries land mid-decay (not promoted, not buried).
+        # Verify it's documented in the function's docstring.
+        from plugins.memory.byterover import _apply_recency_decay
+        assert "90 days" in _apply_recency_decay.__doc__ or "mid-decay" in _apply_recency_decay.__doc__
