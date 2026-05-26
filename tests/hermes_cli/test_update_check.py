@@ -16,46 +16,55 @@ def test_version_string_no_v_prefix():
     assert not __version__.startswith("v"), f"__version__ should not start with 'v', got {__version__!r}"
 
 
-def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
-    from hermes_cli.banner import check_for_updates
-
-    # Create a fake git repo and fresh cache
-    repo_dir = tmp_path / "hermes-agent"
-    repo_dir.mkdir()
-    (repo_dir / ".git").mkdir()
-
-    cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
-        result = check_for_updates()
-
-    assert result == 3
-    mock_run.assert_not_called()
-
-
-def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
-    """When cache is expired, check_for_updates should call git fetch."""
+def test_check_for_updates_no_filesystem_cache(tmp_path, monkeypatch):
+    """Prax custom 2026-05-26: filesystem cache REMOVED. Even if a stale
+    cache file exists on disk from before the rip-out, check_for_updates
+    must ignore it and run the real git commands.
+    """
     from hermes_cli.banner import check_for_updates
 
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
 
-    # Write an expired cache (timestamp far in the past)
+    # Lay down a stale cache that says "behind: 99" — this should be ignored
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": 0, "behind": 1}))
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 99}))
 
-    mock_result = MagicMock(returncode=0, stdout="5\n")
+    mock_result = MagicMock(returncode=0, stdout="7\n")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
         result = check_for_updates()
 
-    assert result == 5
-    assert mock_run.call_count == 2  # git fetch + git rev-list
+    # Should return the live git result (7), NOT the cached 99
+    assert result == 7
+    # And subprocess MUST have been called (cache bypass)
+    assert mock_run.call_count >= 1
+
+
+def test_check_for_updates_runs_git_every_call(tmp_path, monkeypatch):
+    """Prax custom 2026-05-26: every call hits git directly — no cache
+    short-circuit, no timestamp gating.
+    """
+    from hermes_cli.banner import check_for_updates
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    mock_result = MagicMock(returncode=0, stdout="5\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+        result1 = check_for_updates()
+        result2 = check_for_updates()
+
+    assert result1 == 5
+    assert result2 == 5
+    # Two calls → roughly 2x the git invocations (fetch + rev-list each call).
+    # Pre-rip-out, the second call would have been served from cache → ≤ N.
+    assert mock_run.call_count >= 4
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
@@ -112,6 +121,36 @@ def test_prefetch_non_blocking():
         # Wait for the background thread to finish
         banner._update_check_done.wait(timeout=5)
         assert banner._update_result == 5
+
+
+def test_prefetch_sets_event_even_when_check_raises():
+    """Prax custom 2026-05-26: regression test for AUDIT-8 latent bug.
+
+    If check_for_updates() raises, the prefetch thread used to crash without
+    setting _update_check_done, which then made every get_update_result()
+    call block the full timeout (30s) with no widget.
+    """
+    import hermes_cli.banner as banner
+
+    # Reset module state
+    banner._update_result = None
+    banner._update_check_done = threading.Event()
+
+    with patch.object(banner, "check_for_updates",
+                      side_effect=RuntimeError("simulated failure")):
+        banner.prefetch_update_check()
+        # Wait briefly for the thread to crash
+        event_set = banner._update_check_done.wait(timeout=2.0)
+
+    assert event_set, (
+        "_update_check_done must be set even when check_for_updates raises "
+        "— otherwise format_banner_version_label() blocks the full 30s on "
+        "every call after a crashed prefetch."
+    )
+    # And the result must be None (not stale), so the widget cleanly omits
+    assert banner._update_result is None, (
+        f"_update_result should be None after a crash, got {banner._update_result!r}"
+    )
 
 
 def test_invalidate_update_cache_clears_all_profiles(tmp_path):
