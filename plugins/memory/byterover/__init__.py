@@ -112,6 +112,16 @@ _FRONTMATTER_RE = re.compile(
 _FENCE_BEGIN_MARKER = "<!-- byterover-context-begin -->"
 _FENCE_END_MARKER = "<!-- byterover-context-end -->"
 
+# Sanitized escapes for marker-in-content collision (council Round 3 HIGH-2).
+# When a curated entry body itself contains the begin/end markers (e.g. a
+# learning ABOUT the fence design — exactly the project's own self-write
+# pattern), wrapping in prefetch() would yield a malformed nested block where
+# the strip regex's non-greedy match terminates on the embedded END marker
+# and leaks the tail. We replace embedded markers with these zero-width
+# escape variants BEFORE wrapping.
+_FENCE_BEGIN_ESCAPE = "<!-- byterover-context-begin-ZWNJ -->"
+_FENCE_END_ESCAPE = "<!-- byterover-context-end-ZWNJ -->"
+
 # Strip the WHOLE fenced block in one operation. The block contains the recall
 # preamble + entries; everything outside the markers is preserved verbatim.
 _FENCE_BLOCK_RE = re.compile(
@@ -122,11 +132,35 @@ _FENCE_BLOCK_RE = re.compile(
     re.MULTILINE,
 )
 
+# Defensive sweep regex: an unmatched begin marker (truncation, partial write,
+# adversarial chat-of-thought) without a paired end marker. Strips the whole
+# line containing the orphan begin marker so it doesn't leak through.
+_ORPHAN_BEGIN_RE = re.compile(
+    r".*" + re.escape(_FENCE_BEGIN_MARKER) + r".*\n?",
+    re.MULTILINE,
+)
+
 # Bound on _last_prefetched_slugs to keep memory + audit-log line size finite.
+# (Audit-only attribution; structural strip is fence source-of-truth.)
 _MAX_TRACKED_SLUGS = 50
 
-# Truncate slug-csv field in audit log so each line stays under 4 KB PIPE_BUF.
+# Cap slug-csv field in audit log so each line stays bounded. POSIX
+# write atomicity on regular O_APPEND files is filesystem-dependent (ext4,
+# APFS, ZFS all give per-write atomicity for short writes; PIPE_BUF only
+# applies to pipes/FIFOs). 50 slugs at ~50 chars each is ~2.5 KB, plus
+# timestamp/session_id/chars-stripped/flag = under 3 KB total — well below
+# any plausible filesystem write-atomicity boundary on macOS or Linux.
 _AUDIT_LOG_SLUG_CSV_MAX = 50
+
+# Feature flag: env-var kill switch (council Round 3 HIGH-1). When set to
+# any of {"0", "false", "no", "off"} (case-insensitive), the fence is
+# bypassed BYTE-FOR-BYTE: prefetch() does not inject markers, and
+# _apply_context_fence() returns input unchanged. Use this to revert
+# behavior without a code-revert during the 7-day rollout audit window.
+def _fencing_enabled() -> bool:
+    """Return False iff BRV_CONTEXT_FENCING explicitly disables fencing."""
+    val = os.environ.get("BRV_CONTEXT_FENCING", "1").strip().lower()
+    return val not in {"0", "false", "no", "off"}
 
 # Frontmatter scalar field — `status: <value>` on its own line. Tolerates
 # single quotes, double quotes, or no quotes around the value.
@@ -236,6 +270,13 @@ def _apply_recency_decay(entries: List[Tuple[str, str]]) -> List[Tuple[str, str]
     promote entries with explicit `updatedAt` newer than 7 days, so that
     a freshly-amended `[RESOLVED]` entry doesn't get buried by a 3-month-old
     similar-text match.
+
+    Legacy entries with NO `updatedAt` field are assigned a synthetic age
+    of 90 days (mid-decay zone). This is intentional: a brand-new entry
+    without a timestamp would otherwise rank either at the very top
+    (treated as 0 days old) or the very bottom (treated as infinitely
+    old) — neither is honest. 90 days lands in the middle of the decay
+    curve, neither promoted nor buried.
 
     The preamble (slug=__preamble__) is preserved at index 0.
     """
@@ -423,16 +464,44 @@ def _extract_slugs_from_brv_output(text: str) -> List[str]:
     return list(seen.keys())
 
 
+def _sanitize_embedded_markers(text: str) -> str:
+    """Replace any embedded fence markers with escape variants.
+
+    Council Round 3 HIGH-2: if a curated entry body contains the begin/end
+    markers (e.g. a learning ABOUT the fence design — this very project's
+    own self-write pattern), wrapping in prefetch() would yield a malformed
+    nested block. We escape embedded markers BEFORE wrapping. Recall is
+    semantically unchanged (the agent reading the markdown sees a hyphen-
+    suffixed comment that's still invisible in render).
+    """
+    if not text:
+        return text
+    # Replace any literal occurrence of the markers (NOT regex, exact match).
+    return text.replace(
+        _FENCE_BEGIN_MARKER, _FENCE_BEGIN_ESCAPE,
+    ).replace(
+        _FENCE_END_MARKER, _FENCE_END_ESCAPE,
+    )
+
+
 def _wrap_with_fence_markers(filtered_output: str) -> str:
     """Wrap a brv-shaped output block with HTML-comment fence markers.
 
     These markers are invisible in markdown rendering but provide a
     deterministic anchor for the structural strip in
-    `_apply_context_fence`.
+    `_apply_context_fence`. Embedded markers in the input are sanitized
+    first to prevent the marker-in-content collision (council Round 3
+    HIGH-2).
+
+    Disabled when BRV_CONTEXT_FENCING env var is "0"/"false"/"no"/"off"
+    — returns the prior un-marked block, byte-for-byte equivalent to
+    pre-L4 behavior (council Round 3 HIGH-1).
     """
+    if not _fencing_enabled():
+        return f"## ByteRover Context\n{filtered_output}"
     return (
         f"{_FENCE_BEGIN_MARKER}\n"
-        f"## ByteRover Context\n{filtered_output}\n"
+        f"## ByteRover Context\n{_sanitize_embedded_markers(filtered_output)}\n"
         f"{_FENCE_END_MARKER}"
     )
 
@@ -445,11 +514,30 @@ def _apply_context_fence(text: str) -> Tuple[str, int]:
     the only safe way to strip — per-slug regex breaks on nested `###`
     sub-headers inside entry bodies.
 
-    No-op if no begin marker is found.
+    Disabled when BRV_CONTEXT_FENCING env var is set to a falsy value
+    (council Round 3 HIGH-1).
+
+    Defensive sweep removes orphan begin markers (truncation, partial
+    write, adversarial assistant content) before returning so the marker
+    string itself never leaks through to brv curate (council Round 3
+    HIGH-3).
+
+    No-op fast path if no begin marker is found.
     """
+    if not _fencing_enabled():
+        return text, 0
+    # Fast-path: if no begin marker is present at all, skip the regex entirely
+    # (council Round 3 HIGH-3 perf mitigation — assistant content of 50-100KB
+    # without any recall would otherwise pay the regex compile-and-scan cost).
     if not text or _FENCE_BEGIN_MARKER not in text:
         return text, 0
+    # Phase 1: strip well-formed begin/end blocks.
     fenced, n_strips = _FENCE_BLOCK_RE.subn("", text)
+    # Phase 2: any remaining orphan begin markers (no paired end) are stripped
+    # line-by-line. This covers truncation, partial assistant writes, and
+    # adversarial cases where the assistant emits a begin marker mid-stream.
+    if _FENCE_BEGIN_MARKER in fenced:
+        fenced = _ORPHAN_BEGIN_RE.sub("", fenced)
     return fenced, n_strips
 
 
@@ -936,8 +1024,25 @@ class ByteRoverMemoryProvider(MemoryProvider):
         if not content:
             return tool_error("content is required")
 
+        # Schema v1.2 (Round 3 defense-in-depth): explicit user-invoked
+        # curate is also fenced. If the agent loops a recalled-block back
+        # into a brv_curate call (rare, but possible during reasoning),
+        # this prevents the fresh entry from re-importing recall verbatim.
+        slugs_snapshot: Tuple[str, ...] = tuple(self._last_prefetched_slugs)
+        fenced_content, n_strips = _apply_context_fence(content)
+        if n_strips > 0:
+            _log_fence_decision(
+                brv_cwd=self._cwd,
+                session_id=self._session_id,
+                slugs_for_audit=slugs_snapshot,
+                chars_stripped=len(content) - len(fenced_content),
+                fully_fenced=(len(fenced_content.strip()) < _MIN_OUTPUT_LEN),
+            )
+        if len(fenced_content.strip()) < _MIN_OUTPUT_LEN:
+            return tool_error("content is empty after fence strip")
+
         result = _run_brv(
-            ["curate", "--", content],
+            ["curate", "--", fenced_content],
             timeout=_CURATE_TIMEOUT, cwd=self._cwd,
         )
 
