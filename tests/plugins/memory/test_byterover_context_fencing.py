@@ -812,3 +812,95 @@ class TestRecencyDecayDeterminism:
         # Verify it's documented in the function's docstring.
         from plugins.memory.byterover import _apply_recency_decay
         assert "90 days" in _apply_recency_decay.__doc__ or "mid-decay" in _apply_recency_decay.__doc__
+
+
+class TestAuditLogSlugCsvMax:
+    """P3-1 (2026-05-28): boundary test for _AUDIT_LOG_SLUG_CSV_MAX.
+
+    The cap exists to keep each audit log line under PIPE_BUF (~4KB) so
+    write-to-fd is atomic on POSIX filesystems. If someone bumps the cap
+    in the future without checking the math, this test catches the
+    regression — line length must stay under a safe atomicity ceiling.
+    """
+
+    def test_cap_truncates_excess_slugs(self, tmp_path):
+        """Slugs beyond _AUDIT_LOG_SLUG_CSV_MAX get truncated with a marker."""
+        brv_cwd = str(tmp_path)
+        # Pass 60 slugs when cap is 50 — expect first 50 + truncation marker
+        many_slugs = tuple(f"slug-{i:03d}" for i in range(60))
+        _log_fence_decision(
+            brv_cwd=brv_cwd,
+            session_id="test-session",
+            slugs_for_audit=many_slugs,
+            chars_stripped=1000,
+            fully_fenced=False,
+        )
+        log_path = tmp_path / ".brv" / "fenced.log"
+        assert log_path.exists()
+        line = log_path.read_text().splitlines()[0]
+        # First 50 slugs present
+        for i in range(_AUDIT_LOG_SLUG_CSV_MAX):
+            assert f"slug-{i:03d}" in line
+        # Truncation marker present with correct count
+        excess = 60 - _AUDIT_LOG_SLUG_CSV_MAX
+        assert f"...trunc({excess} more)" in line
+        # Slugs beyond cap NOT present (verify no leak)
+        for i in range(_AUDIT_LOG_SLUG_CSV_MAX, 60):
+            assert f"slug-{i:03d}" not in line
+
+    def test_line_length_stays_under_pipe_buf(self, tmp_path):
+        """At cap with realistic slug-length, line must stay under 4KB
+        (POSIX PIPE_BUF) to preserve write-atomicity on regular files.
+
+        macOS APFS, ext4, ZFS all give per-write atomicity for short
+        writes; PIPE_BUF only applies to pipes/FIFOs but is a useful
+        upper bound for log-line atomicity on append-mode regular files.
+
+        At _AUDIT_LOG_SLUG_CSV_MAX=50 with 50-char slugs:
+          50 slugs × 50 chars + 49 commas = 2549 chars
+          + ISO ts (~25) + session_id (≤64) + chars_stripped (~10)
+          + fully_fenced (~20) + tabs/newline (~5) ≈ 2673 chars
+        Well under 4096 PIPE_BUF.
+        """
+        brv_cwd = str(tmp_path)
+        # Realistic worst-case: 50 slugs each at the longest name we'd see
+        # in practice. ByteRover slugs are typically 10-40 chars; 50 chars
+        # is a generous upper bound.
+        long_slugs = tuple(f"some-long-namespace/sub-area/slug-name-{i:03d}" for i in range(_AUDIT_LOG_SLUG_CSV_MAX))
+        # Verify our test setup matches realistic upper bound
+        for s in long_slugs:
+            assert 30 <= len(s) <= 70, f"test slug {s!r} length {len(s)} outside expected range"
+
+        _log_fence_decision(
+            brv_cwd=brv_cwd,
+            session_id="x" * 64,  # max session_id length
+            slugs_for_audit=long_slugs,
+            chars_stripped=1234567,
+            fully_fenced=True,
+        )
+        log_path = tmp_path / ".brv" / "fenced.log"
+        line = log_path.read_text().splitlines()[0]
+        # PIPE_BUF safety ceiling — must stay under 4KB
+        assert len(line) < 4096, (
+            f"audit log line is {len(line)} chars, exceeds PIPE_BUF=4096; "
+            f"_AUDIT_LOG_SLUG_CSV_MAX={_AUDIT_LOG_SLUG_CSV_MAX} or slug naming "
+            f"convention has grown — re-audit the cap math"
+        )
+
+    def test_under_cap_no_truncation_marker(self, tmp_path):
+        """When slug count is at-or-below cap, no truncation marker emitted."""
+        brv_cwd = str(tmp_path)
+        few_slugs = tuple(f"slug-{i:03d}" for i in range(_AUDIT_LOG_SLUG_CSV_MAX))  # exactly at cap
+        _log_fence_decision(
+            brv_cwd=brv_cwd,
+            session_id="test",
+            slugs_for_audit=few_slugs,
+            chars_stripped=100,
+            fully_fenced=False,
+        )
+        log_path = tmp_path / ".brv" / "fenced.log"
+        line = log_path.read_text().splitlines()[0]
+        assert "...trunc(" not in line, "no truncation marker expected at exactly cap"
+        # All slugs present
+        for i in range(_AUDIT_LOG_SLUG_CSV_MAX):
+            assert f"slug-{i:03d}" in line
