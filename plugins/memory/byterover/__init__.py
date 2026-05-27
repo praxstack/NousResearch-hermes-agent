@@ -75,6 +75,7 @@ _HISTORICAL_INTENT_TOKENS = (
     "historically",
     "in the past",
     "past run",
+    "old ",                # "old daemon", "old bug" — natural historical phrasing
     "old rca",
     "already fixed",
     "already shipped",
@@ -82,7 +83,17 @@ _HISTORICAL_INTENT_TOKENS = (
     "archived",
     "archive ",
     "when did we",
+    "what did we",         # complements "when did we" — past-tense intent
     "what did we ship",
+    "what we tried",       # past-tense indicator
+    "used to",             # "this used to work" — historical intent
+    "earlier",             # "earlier version" / "earlier commit"
+    "yesterday",
+    "last week",
+    "last month",
+    "forgotten",           # "what did we forget" — past-perfect indicator
+    "backed out",          # "we backed out the change"
+    "reverted",            # "what got reverted"
     "show resolved",
     "show all",
     "include resolved",
