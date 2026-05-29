@@ -3856,6 +3856,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     region_tag = _m.group(1)
 
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
+
+        # ── Reasoning / thinking / output knobs (Prax custom 2026-05-29) ──
+        # Surface what the model is ACTUALLY running with so "max effort + 1M
+        # ctx + adaptive thinking" doesn't stay invisible.
+        # self.reasoning_config is a dict like {"effort": "max", ...} populated
+        # from CLI_CONFIG["agent"]["reasoning_effort"] in __init__.
+        _reasoning_effort = None
+        _rc = getattr(self, "reasoning_config", None)
+        if isinstance(_rc, dict):
+            _reasoning_effort = _rc.get("effort") or _rc.get("level")
+        # Fallback to live agent attribute (some hosts populate this directly).
+        if not _reasoning_effort:
+            _reasoning_effort = getattr(agent, "reasoning_effort", None)
+        # Last fallback: read CLI_CONFIG directly (should already be in
+        # reasoning_config but be defensive on hot reloads / fresh sessions).
+        if not _reasoning_effort:
+            try:
+                from hermes_cli.config import load_config as _lc
+                _cfg = _lc()
+                _reasoning_effort = (_cfg.get("agent", {}) or {}).get("reasoning_effort") or None
+            except Exception:
+                pass
+        # Adaptive thinking is on by default for Opus 4-7+ (and 4-8) on Bedrock
+        # — Hermes' bedrock_adapter sets thinking={type:adaptive} automatically.
+        # Detect by model family: any claude-opus-4-7+, claude-sonnet-4-6+.
+        _thinking_mode = None
+        _model_lower = (model_name or "").lower()
+        if any(s in _model_lower for s in ("opus-4-7", "opus-4-8", "opus-5",
+                                            "sonnet-4-6", "sonnet-4-7", "sonnet-5")):
+            _thinking_mode = "adaptive"
+        # 1M context = encoded in :1m suffix (Hermes-internal sigil) OR
+        # context_length >= 1M.
+        _ctx_1m_enabled = ":1m" in (model_name or "")
+
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
@@ -3880,6 +3914,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
+            "reasoning_effort": _reasoning_effort,
+            "thinking_mode": _thinking_mode,
+            "ctx_1m_enabled": _ctx_1m_enabled,
         }
 
         # Count live /background tasks. The dict entry is removed in the
@@ -4169,6 +4206,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _model_with_region = f"⚕ {snapshot['model_short']}"
             if _region:
                 _model_with_region = f"⚕ {snapshot['model_short']} · {_region}"
+
+            # ── Reasoning / 1M / thinking badge (Prax custom 2026-05-29) ──
+            # Show what the model is REALLY running with: effort, 1M context,
+            # adaptive thinking. Compact, single segment, only emits when
+            # any signal is non-default.
+            _badges = []
+            _effort = snapshot.get("reasoning_effort")
+            if _effort:
+                _badges.append(f"🧠 {_effort}")
+            if snapshot.get("ctx_1m_enabled"):
+                _badges.append("1M")
+            _think = snapshot.get("thinking_mode")
+            if _think:
+                _badges.append(_think)
+            if _badges:
+                _model_with_region += " · " + " · ".join(_badges)
+
             parts = [_model_with_region, context_label, percent_label]
             if compressions:
                 parts.append(f"🗜️ {compressions}")
@@ -4211,11 +4265,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     ("class:status-bar-dim", _region),
                 ]
 
+            # ── Reasoning / 1M / thinking badge fragments (Prax custom 2026-05-29) ──
+            # Surface the actual reasoning_effort + 1M context + adaptive
+            # thinking signals so the user can SEE that opus-4-8 is running
+            # at max effort, not silently degraded. status-bar-strong for the
+            # value (so it visually pops vs the dim region tag), status-bar-dim
+            # for the separator + label glyph.
+            _badge_frags = []
+            _effort = snapshot.get("reasoning_effort")
+            if _effort:
+                _badge_frags.extend([
+                    ("class:status-bar-dim", " · "),
+                    ("class:status-bar-strong", f"🧠 {_effort}"),
+                ])
+            if snapshot.get("ctx_1m_enabled"):
+                _badge_frags.extend([
+                    ("class:status-bar-dim", " · "),
+                    ("class:status-bar-strong", "1M"),
+                ])
+            _think = snapshot.get("thinking_mode")
+            if _think:
+                _badge_frags.extend([
+                    ("class:status-bar-dim", " · "),
+                    ("class:status-bar-dim", _think),
+                ])
+
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
                     *_region_frags,
+                    *_badge_frags,
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                 ]
@@ -4234,6 +4314,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
                         *_region_frags,
+                        *_badge_frags,
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
                     ]
@@ -4270,6 +4351,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
                         *_region_frags,
+                        *_badge_frags,
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
