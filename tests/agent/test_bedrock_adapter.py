@@ -1244,6 +1244,24 @@ class TestBedrockErrorClassification:
 class TestBedrockContextLength:
     """Test Bedrock model context length lookup."""
 
+    def test_claude_opus_4_8_default_is_200k(self):
+        """Opus 4.8 on Bedrock defaults to 200K — 1M requires :1m suffix."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-opus-4-8") == 200_000
+
+    def test_claude_opus_4_8_1m_variant_is_1m(self):
+        """Opus 4.8 with :1m suffix returns 1M context (regression: the
+        region+:1m-suffixed compression-model lookup used to fall through
+        to the generic claude-opus-4 200K entry)."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-opus-4-8:1m") == 1_000_000
+
+    def test_claude_opus_4_8_regional_1m_variant_is_1m(self):
+        """Regional inference-profile + :1m (the exact compression-model
+        string ``us.anthropic.claude-opus-4-8:1m``) resolves to 1M."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("us.anthropic.claude-opus-4-8:1m") == 1_000_000
+
     def test_claude_opus_4_7_default_is_200k(self):
         """Opus 4.7 on Bedrock defaults to 200K — 1M requires :1m suffix."""
         from agent.bedrock_adapter import get_bedrock_context_length
