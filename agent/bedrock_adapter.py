@@ -512,6 +512,7 @@ def _bedrock_forbids_temp_and_top_p_together(wire_model: str) -> bool:
 # prefixes are handled at runtime via the prefix check in
 # ``split_bedrock_1m_suffix``.
 _CLAUDE_1M_CAPABLE_BASE_IDS = (
+    "anthropic.claude-opus-4-8",
     "anthropic.claude-opus-4-7",
     "anthropic.claude-opus-4-6-v1",
     "anthropic.claude-opus-4-6",
@@ -1927,6 +1928,7 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Bedrock serves these at 200K by default; the 1M variant (see below)
     # requires the ``context-1m-2025-08-07`` beta and is opted into via
     # the ``:1m`` suffix on the model ID (matches Cline's UX).
+    "anthropic.claude-opus-4-8":     200_000,
     "anthropic.claude-opus-4-7":     200_000,
     "anthropic.claude-opus-4-6":     200_000,
     "anthropic.claude-sonnet-4-6":   200_000,
@@ -1944,6 +1946,7 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Verified against Anthropic docs (Apr 28 2026):
     # https://docs.anthropic.com/en/docs/build-with-claude/context-windows
     # and Cline's bedrock.ts model catalog.
+    "anthropic.claude-opus-4-8:1m":       1_000_000,
     "anthropic.claude-opus-4-7:1m":       1_000_000,
     "anthropic.claude-opus-4-6:1m":       1_000_000,
     "anthropic.claude-opus-4-6-v1:1m":    1_000_000,
