@@ -812,6 +812,24 @@ def resolve_bedrock_auth_config(
             env.get("AWS_BEARER_TOKEN_BEDROCK") or ""
         )
         if not token:
+            # Resilience fallback (2026-05-30): os.environ may transiently lack
+            # the token when a fallback model re-resolves auth mid-conversation
+            # — e.g. after a primary streaming crash interacts with the
+            # _masked_aws_env pop/restore, or before reload_env() has injected
+            # the .env allowlist. The token's canonical home is ~/.hermes/.env;
+            # read it directly so auth resolution is independent of os.environ
+            # injection timing. Root cause of the 292-occurrence NoAuthTokenError
+            # fallback cascade. Behavior is unchanged when os.environ has the
+            # token; this only RECOVERS the previously-fatal absent case.
+            try:
+                from hermes_cli.config import load_env as _load_env
+
+                token = _normalize_bedrock_bearer_token(
+                    _load_env().get("AWS_BEARER_TOKEN_BEDROCK") or ""
+                )
+            except Exception:
+                token = ""
+        if not token:
             raise RuntimeError(
                 "Bedrock auth_method=api_key requires AWS_BEARER_TOKEN_BEDROCK"
             )
