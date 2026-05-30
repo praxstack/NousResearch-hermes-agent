@@ -148,13 +148,42 @@ class TestResolveBedrocRegion:
 
 
 class TestResolveBedrockAuthConfig:
-    def test_api_key_mode_requires_bearer_token(self):
+    def test_api_key_mode_requires_bearer_token(self, monkeypatch):
         from agent.bedrock_adapter import resolve_bedrock_auth_config
+        import hermes_cli.config as _cfg
+
+        # The .env-recovery fallback (2026-05-30) reads load_env() when the
+        # passed env lacks the token. Mock it empty so this test deterministically
+        # exercises the true "neither source has the token" path regardless of
+        # whether a real ~/.hermes/.env exists on the test host.
+        monkeypatch.setattr(_cfg, "load_env", lambda: {})
 
         config = {"bedrock": {"auth_method": "api_key", "region": "us-east-1"}}
 
         with pytest.raises(RuntimeError, match="AWS_BEARER_TOKEN_BEDROCK"):
             resolve_bedrock_auth_config(config=config, env={})
+
+    def test_api_key_mode_recovers_token_from_dotenv_when_env_empty(self, monkeypatch):
+        """Regression (2026-05-30): the 292-occurrence NoAuthTokenError fallback
+        cascade. When os.environ lacks AWS_BEARER_TOKEN_BEDROCK (transient race
+        after a primary streaming crash, or pre-reload_env), the resolver must
+        recover the token from ~/.hermes/.env instead of raising — so fallback
+        models can authenticate."""
+        from agent.bedrock_adapter import resolve_bedrock_auth_config
+        import hermes_cli.config as _cfg
+
+        # os.environ (passed env) is empty, but .env has the token.
+        monkeypatch.setattr(
+            _cfg, "load_env",
+            lambda: {"AWS_BEARER_TOKEN_BEDROCK": "dotenv-recovered-token"},
+        )
+
+        config = {"bedrock": {"auth_method": "api_key", "region": "us-east-1"}}
+        resolved = resolve_bedrock_auth_config(config=config, env={})
+
+        assert resolved["method"] == "api_key"
+        assert resolved["api_key"] == "dotenv-recovered-token"
+        assert resolved["source"] == "AWS_BEARER_TOKEN_BEDROCK"
 
     def test_api_key_mode_keeps_bearer_token_for_client_builders(self):
         from agent.bedrock_adapter import resolve_bedrock_auth_config
