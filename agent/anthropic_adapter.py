@@ -1005,17 +1005,26 @@ def build_anthropic_bedrock_client(
     if method == "api_key":
         # SDK compat: anthropic>=0.86 rejects api_key= on AnthropicBedrock and
         # exposes NO explicit bearer-token kwarg (verified anthropic 0.87.0:
-        # only aws_access_key/aws_secret_key/aws_session_token exist). The
-        # class wraps boto3, and botocore auto-discovers AWS_BEARER_TOKEN_BEDROCK
-        # from os.environ — but it resolves the token LAZILY AT REQUEST TIME,
-        # not at client-construction time.
+        # only aws_access_key/aws_secret_key/aws_session_token exist).
+        #
+        # CORRECTED MECHANISM (2026-06-01 review): botocore does NOT
+        # auto-discover AWS_BEARER_TOKEN_BEDROCK on the bare boto3.Session that
+        # AnthropicBedrock signs with — see _install_apex_bearer_auth_patch
+        # above (this is the entire reason that monkeypatch exists). The
+        # request-time reader is OUR patch's _bearer_aware_get_auth_headers,
+        # which does os.environ.get("AWS_BEARER_TOKEN_BEDROCK") on EVERY signed
+        # request. So the token must be present in os.environ AT REQUEST TIME,
+        # not merely at client construction.
+        # WARNING: do NOT remove _install_apex_bearer_auth_patch believing
+        # botocore handles bearer auth natively — it does not; removing it
+        # re-breaks all bearer-token auth.
         #
         # ROOT-CAUSE FIX (2026-06-01): the previous implementation set the env
         # var INSIDE `with _masked_aws_env(...)` and returned the client from
         # inside that block. The context manager then RESTORED the prior env on
         # exit — popping the token back out BEFORE any request fired. Because
-        # botocore reads the token at request time, every .messages.create()
-        # raised NoAuthTokenError / "could not resolve credentials from
+        # the bearer-auth patch reads the token at request time, every
+        # .messages.create() raised NoAuthTokenError / "could not resolve credentials from
         # session". This was the 292+ -occurrence fallback cascade: the primary
         # survived only via a warm cached client; every fallback region rebuilt
         # a fresh client and died. Empirically reproduced + fixed 2026-06-01.
