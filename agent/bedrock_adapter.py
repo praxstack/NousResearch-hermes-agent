@@ -944,11 +944,13 @@ def _create_bedrock_client(service: str, region: str, auth_config: Dict[str, str
         extra_kwargs["endpoint_url"] = endpoint_url
 
     if method == "api_key":
-        # Persist the bearer token into os.environ so botocore's REQUEST-TIME
-        # resolution can see it (boto resolves AWS_BEARER_TOKEN_BEDROCK lazily,
-        # not at client construction — verified 2026-06-01). Mask only the
-        # COMPETING auth sources during the build so they can't shadow the
-        # bearer token. Root-cause fix for the NoAuthTokenError fallback cascade
+        # Persist the bearer token into os.environ so the SDK's request-time
+        # auth (the _bearer_aware_get_auth_headers monkeypatch, and bearer-mode
+        # signing on a service client) can read it. The token is resolved
+        # LAZILY AT REQUEST TIME from os.environ, not bound at client
+        # construction — verified 2026-06-01. Mask only the COMPETING auth
+        # sources during the build so they can't shadow the bearer token.
+        # Root-cause fix for the NoAuthTokenError fallback cascade
         # (the previous mask popped the token before any request fired).
         import os as _os
         if auth_config.get("api_key"):
