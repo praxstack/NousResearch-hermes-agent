@@ -271,15 +271,67 @@ class TestBuildAnthropicBedrockClient:
         # Bearer token was visible to boto3 during the SDK call
         assert observed_token["value"] == "absk-test-token"
 
-    def test_api_key_mode_restores_env_after_sdk_call(self, monkeypatch):
-        """Code review P1-A regression test (2026-05-24). Before the fix,
-        the api_key path mutated os.environ['AWS_BEARER_TOKEN_BEDROCK']
-        unconditionally and never restored prior state. This leaked the
-        token to all other concurrent threads / pooled gateway processes
-        in the same Python interpreter. Fix: wrap the SDK call in
-        _masked_aws_env so the env var is restored on context exit.
+    def test_api_key_token_visible_at_request_time_not_just_build(self, monkeypatch):
+        """NoAuthTokenError root-cause regression (2026-06-01).
+
+        The killer bug: botocore (under AnthropicBedrock) resolves the bearer
+        token LAZILY AT REQUEST TIME. The old code set it inside _masked_aws_env
+        and the manager restored the prior (empty) env on block exit — so the
+        token was GONE by the time .messages.create() fired. This test proves
+        the token is still in os.environ AFTER the builder returns (i.e. it
+        would be visible at request time), under the exact production condition
+        where the token was never in os.environ to begin with (recovered from
+        ~/.hermes/.env into auth_config by the resolver)."""
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        import os as _os
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            mock_sdk.AnthropicBedrock = MagicMock()
+            build_anthropic_bedrock_client(
+                "ap-northeast-3",  # a FALLBACK region — fresh build, the cascade hop
+                auth_config={
+                    "method": "api_key",
+                    "api_key": "absk-recovered-from-dotenv",
+                    "region": "ap-northeast-3",
+                },
+            )
+        # AFTER the builder returns and the (competing-only) mask has exited,
+        # the bearer token must STILL be present for request-time resolution.
+        assert _os.environ.get("AWS_BEARER_TOKEN_BEDROCK") == "absk-recovered-from-dotenv", (
+            "NoAuthTokenError regression: bearer token must persist past the "
+            "builder so botocore can resolve it at request time on fallback "
+            "regions (the 292+ -occurrence cascade)"
+        )
+        _os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
+
+    def test_api_key_mode_persists_token_for_request_time_resolution(self, monkeypatch):
+        """Phase: NoAuthTokenError root-cause fix (2026-06-01).
+
+        SUPERSEDES the prior P1-A "restore env after SDK call" contract.
+
+        Why the contract changed:
+        AnthropicBedrock (anthropic 0.87.0) exposes NO explicit bearer-token
+        kwarg — it wraps boto3, which auto-discovers AWS_BEARER_TOKEN_BEDROCK
+        from os.environ and resolves it LAZILY AT REQUEST TIME, not at client
+        construction. The old P1-A fix set the token INSIDE _masked_aws_env and
+        returned the client from inside that block, so the context manager
+        popped the token back out BEFORE any request fired. Result: every
+        .messages.create() raised NoAuthTokenError / "could not resolve
+        credentials from session" — the 292+ -occurrence fallback cascade
+        (primary survived only via a warm cached client; fresh fallback-region
+        clients all died).
+
+        New contract: in api_key mode the bearer token MUST persist in
+        os.environ for the client's lifetime so request-time resolution
+        succeeds. The original P1-A "leak" concern is moot for the bearer
+        token: in api_key mode every thread / pooled process in this
+        interpreter authenticates with the SAME canonical token (single source:
+        ~/.hermes/.env via the resolver), so a shared os.environ value is
+        correct, not a leak. Competing sources (access keys, profile, role,
+        container creds) are still masked at build time so they cannot shadow
+        the bearer token; profile/default_chain builders still mask the bearer
+        token at THEIR build time so a consumer that wants no bearer token is
+        unaffected.
         """
-        # Case 1: env was unset before — must remain unset after
         monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             mock_sdk.AnthropicBedrock = MagicMock()
@@ -292,26 +344,35 @@ class TestBuildAnthropicBedrockClient:
                 },
             )
         import os as _os
-        assert "AWS_BEARER_TOKEN_BEDROCK" not in _os.environ, (
-            "P1-A regression: api_key path leaked AWS_BEARER_TOKEN_BEDROCK "
-            "into env when it was unset before the call"
+        # NEW contract: token persists so botocore can resolve it at REQUEST
+        # time (the whole point of the fix).
+        assert _os.environ.get("AWS_BEARER_TOKEN_BEDROCK") == "absk-call-1", (
+            "api_key mode must PERSIST the bearer token in os.environ so "
+            "botocore's request-time resolution succeeds (NoAuthTokenError fix)"
         )
+        # Cleanup so this test doesn't leak into sibling tests.
+        _os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
 
-        # Case 2: env was set to a different token before — must be restored
-        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "prior-token-xyz")
+        # A subsequent profile-mode build must still MASK the (now-persistent)
+        # bearer token at its own build time so it cannot shadow the profile.
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "absk-persistent")
+        captured = {}
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            mock_sdk.AnthropicBedrock = MagicMock()
+            def _capture(**kw):
+                captured["token_visible"] = _os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+                return MagicMock()
+            mock_sdk.AnthropicBedrock = MagicMock(side_effect=_capture)
             build_anthropic_bedrock_client(
                 "us-east-1",
                 auth_config={
-                    "method": "api_key",
-                    "api_key": "absk-call-2-different",
+                    "method": "profile",
+                    "profile": "bedrock-dev",
                     "region": "us-east-1",
                 },
             )
-        assert _os.environ.get("AWS_BEARER_TOKEN_BEDROCK") == "prior-token-xyz", (
-            "P1-A regression: api_key path overwrote prior bearer token "
-            "and never restored it"
+        assert captured["token_visible"] is None, (
+            "profile-mode build must still mask the bearer token at build time "
+            "so it cannot shadow the configured profile"
         )
 
     def test_profile_mode_masks_ambient_bedrock_api_key(self, monkeypatch):
