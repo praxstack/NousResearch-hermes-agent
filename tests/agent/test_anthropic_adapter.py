@@ -362,13 +362,23 @@ class TestBuildAnthropicBedrockClient:
         # Cleanup so this test doesn't leak into sibling tests.
         _os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
 
-        # A subsequent profile-mode build must still MASK the (now-persistent)
-        # bearer token at its own build time so it cannot shadow the profile.
+        # B1 (2026-06-01 council): the profile-mode build no longer masks the
+        # bearer token (masking it re-opened the NoAuthTokenError race for the
+        # api_key-only majority case). The profile still wins because it is
+        # passed as an EXPLICIT aws_profile= kwarg, which beats env-var
+        # auto-discovery in boto precedence. NOTE (documented tradeoff): if the
+        # bearer-auth monkeypatch is active AND a profile client is built with
+        # an ambient bearer token AND no explicit IAM keys, the patched
+        # get_auth_headers could sign with the bearer token. This is why B3
+        # warns loudly when api_key mode coexists with IAM/profile creds, and
+        # why the proper long-term fix is per-client token binding (B2, tracked
+        # tech debt). Unreachable in the api_key-only Bedrock setup.
         monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "absk-persistent")
         captured = {}
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             def _capture(**kw):
                 captured["token_visible"] = _os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+                captured["aws_profile_kwarg"] = kw.get("aws_profile")
                 return MagicMock()
             mock_sdk.AnthropicBedrock = MagicMock(side_effect=_capture)
             build_anthropic_bedrock_client(
@@ -379,9 +389,10 @@ class TestBuildAnthropicBedrockClient:
                     "region": "us-east-1",
                 },
             )
-        assert captured["token_visible"] is None, (
-            "profile-mode build must still mask the bearer token at build time "
-            "so it cannot shadow the configured profile"
+        # The profile is passed explicitly — that is what makes it win.
+        assert captured["aws_profile_kwarg"] == "bedrock-dev", (
+            "profile must be passed as an explicit kwarg so it beats env-var "
+            "auto-discovery regardless of an ambient bearer token"
         )
 
     def test_profile_mode_masks_ambient_bedrock_api_key(self, monkeypatch):
@@ -457,32 +468,80 @@ class TestBuildAnthropicBedrockClient:
             "this is the exact NoAuthTokenError mechanism"
         )
 
-    def test_competing_mask_excludes_bearer_token(self):
-        """Guards the fix's central invariant: the api_key build mask must NOT
-        contain AWS_BEARER_TOKEN_BEDROCK (else the build pops the token the fix
-        just persisted). Plus a documented LATENT-RACE warning: the OTHER three
-        masks (profile/credentials/default_chain) DO still pop the bearer token,
-        so a concurrent non-api_key client build can transiently blank it for an
-        in-flight api_key request. This is unreachable while auth is api_key-only
-        with no IAM creds (the current Bedrock-only setup), but becomes a live
-        race the moment IAM creds appear. If this test ever needs updating
-        because a non-api_key build path went hot, escalate to council (§4.5):
-        the correct fix is per-client token binding, not global os.environ."""
+    def test_bearer_token_never_masked_anywhere(self):
+        """Race-closed invariant (2026-06-01 council B1). The bearer token is
+        persisted process-wide in api_key mode and read at request time. If ANY
+        mask pops it, a concurrent non-api_key client build transiently blanks
+        it and an in-flight api_key request hits NoAuthTokenError (reproduced:
+        186k/246k empty reads before B1; 0/210k after). Therefore
+        AWS_BEARER_TOKEN_BEDROCK must NOT appear in ANY mask tuple. This test is
+        the regression guard: if someone re-adds the token to any mask, it
+        re-opens the race."""
         from agent.bedrock_adapter import (
-            _AWS_ENV_MASK_FOR_API_KEY_COMPETING,
             _AWS_ENV_MASK_FOR_API_KEY,
+            _AWS_ENV_MASK_FOR_API_KEY_COMPETING,
+            _AWS_ENV_MASK_FOR_PROFILE,
+            _AWS_ENV_MASK_FOR_CREDENTIALS,
             _AWS_ENV_MASK_FOR_DEFAULT_CHAIN,
         )
-        assert "AWS_BEARER_TOKEN_BEDROCK" not in _AWS_ENV_MASK_FOR_API_KEY_COMPETING, (
-            "competing mask must EXCLUDE the bearer token — including it re-introduces "
-            "the build-time pop that caused NoAuthTokenError"
-        )
-        # Sanity: the competing mask is the full api_key mask minus the token.
+        TOK = "AWS_BEARER_TOKEN_BEDROCK"
+        # The api_key builders use the COMPETING mask — must exclude the token.
+        assert TOK not in _AWS_ENV_MASK_FOR_API_KEY_COMPETING
         assert set(_AWS_ENV_MASK_FOR_API_KEY_COMPETING) == (
-            set(_AWS_ENV_MASK_FOR_API_KEY) - {"AWS_BEARER_TOKEN_BEDROCK"}
+            set(_AWS_ENV_MASK_FOR_API_KEY) - {TOK}
         )
-        # Documents the latent-race surface: these masks DO still pop the token.
-        assert "AWS_BEARER_TOKEN_BEDROCK" in _AWS_ENV_MASK_FOR_DEFAULT_CHAIN
+        # B1: the OTHER builders must NOT pop the token either (race closed).
+        for mask, name in (
+            (_AWS_ENV_MASK_FOR_PROFILE, "profile"),
+            (_AWS_ENV_MASK_FOR_CREDENTIALS, "credentials"),
+            (_AWS_ENV_MASK_FOR_DEFAULT_CHAIN, "default_chain"),
+        ):
+            assert TOK not in mask, (
+                f"{name} mask must NOT pop {TOK} — doing so re-opens the "
+                "concurrent-blanking race that caused NoAuthTokenError"
+            )
+
+    def test_api_key_mode_warns_on_competing_iam_creds(self, monkeypatch, caplog):
+        """B3 fail-closed guard (2026-06-01 council). The race-closed invariant
+        (B1) rests on 'no IAM creds coexist with api_key mode'. If IAM creds
+        appear, resolve_bedrock_auth_config must surface it loudly so the
+        violated invariant is visible, not silent."""
+        import logging
+        from agent import bedrock_adapter as BA
+        env = {
+            "AWS_BEARER_TOKEN_BEDROCK": "absk-token",
+            "AWS_ACCESS_KEY_ID": "AKIA-competing",
+            "AWS_SECRET_ACCESS_KEY": "secret-competing",
+        }
+        cfg = {"bedrock": {"auth_method": "api_key", "region": "us-east-1"}}
+        with caplog.at_level(logging.WARNING, logger="agent.bedrock_adapter"):
+            result = BA.resolve_bedrock_auth_config(config=cfg, env=env)
+        # Still resolves (loud-warn, not brick) ...
+        assert result["method"] == "api_key"
+        assert result["api_key"] == "absk-token"
+        # ... but the violated invariant was surfaced.
+        assert any(
+            "competing IAM credential" in r.message and "AWS_ACCESS_KEY_ID" in r.message
+            for r in caplog.records
+        ), "B3 guard must warn when IAM creds coexist with api_key mode"
+
+    def test_api_key_mode_silent_when_no_competing_creds(self, monkeypatch, caplog):
+        """B3 guard must NOT warn in the normal (bearer-only) case."""
+        import logging
+        from agent import bedrock_adapter as BA
+        for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
+                  "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE",
+                  "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                  "AWS_CONTAINER_CREDENTIALS_FULL_URI"):
+            monkeypatch.delenv(k, raising=False)
+        env = {"AWS_BEARER_TOKEN_BEDROCK": "absk-token"}
+        cfg = {"bedrock": {"auth_method": "api_key", "region": "us-east-1"}}
+        with caplog.at_level(logging.WARNING, logger="agent.bedrock_adapter"):
+            result = BA.resolve_bedrock_auth_config(config=cfg, env=env)
+        assert result["method"] == "api_key"
+        assert not any(
+            "competing IAM credential" in r.message for r in caplog.records
+        ), "B3 guard must stay silent in the normal bearer-only case"
 
 
 @pytest.mark.usefixtures("_isolate_claude_keychain")
