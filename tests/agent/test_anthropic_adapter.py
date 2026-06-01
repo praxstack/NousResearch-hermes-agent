@@ -409,6 +409,72 @@ class TestBuildAnthropicBedrockClient:
         assert "api_key" not in kwargs
         assert "aws_profile" not in kwargs
 
+    def test_bearer_patch_reads_token_from_environ_at_request_time(self, monkeypatch):
+        """Pins the REAL request-time mechanism (2026-06-01 review).
+
+        The earlier tests all mock AnthropicBedrock, so they never exercise the
+        actual auth path: _install_apex_bearer_auth_patch replaces
+        anthropic.lib.bedrock._auth.get_auth_headers with a bearer-aware version
+        that reads os.environ['AWS_BEARER_TOKEN_BEDROCK'] on EVERY signed
+        request. This test calls that patched function directly to prove (a) the
+        token is read from os.environ at call time (not bound earlier), and
+        (b) when the token is absent the header is NOT emitted (the failure that
+        manifested as NoAuthTokenError downstream). This is the test that would
+        have caught the original bug AND would catch a regression if anyone
+        removes the monkeypatch believing botocore handles bearer auth."""
+        import importlib
+        from agent import anthropic_adapter as AA
+        sdk = AA._get_anthropic_sdk()
+        if sdk is None:
+            pytest.skip("anthropic SDK not installed")
+        try:
+            from anthropic.lib.bedrock import _auth as bedrock_auth
+        except ImportError:
+            pytest.skip("anthropic SDK variant has no lib.bedrock._auth")
+        # The patch must be installed (idempotent; _get_anthropic_sdk does it).
+        assert getattr(bedrock_auth.get_auth_headers, "__apex_bearer_patched__", False), (
+            "bearer-auth monkeypatch not installed — bearer token auth is broken"
+        )
+        # Token PRESENT in os.environ at request time -> Authorization: Bearer emitted.
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "absk-request-time-token")
+        headers_present = bedrock_auth.get_auth_headers(
+            method="POST", url="https://bedrock-runtime.us-east-1.amazonaws.com/x",
+            headers={"content-type": "application/json"},  # type: ignore[arg-type]
+            aws_access_key=None, aws_secret_key=None, aws_session_token=None,
+            region="us-east-1", profile=None, data="{}",
+        )
+        assert headers_present.get("Authorization") == "Bearer absk-request-time-token", (
+            "request-time read of AWS_BEARER_TOKEN_BEDROCK from os.environ failed — "
+            "this is the exact NoAuthTokenError mechanism"
+        )
+
+    def test_competing_mask_excludes_bearer_token(self):
+        """Guards the fix's central invariant: the api_key build mask must NOT
+        contain AWS_BEARER_TOKEN_BEDROCK (else the build pops the token the fix
+        just persisted). Plus a documented LATENT-RACE warning: the OTHER three
+        masks (profile/credentials/default_chain) DO still pop the bearer token,
+        so a concurrent non-api_key client build can transiently blank it for an
+        in-flight api_key request. This is unreachable while auth is api_key-only
+        with no IAM creds (the current Bedrock-only setup), but becomes a live
+        race the moment IAM creds appear. If this test ever needs updating
+        because a non-api_key build path went hot, escalate to council (§4.5):
+        the correct fix is per-client token binding, not global os.environ."""
+        from agent.bedrock_adapter import (
+            _AWS_ENV_MASK_FOR_API_KEY_COMPETING,
+            _AWS_ENV_MASK_FOR_API_KEY,
+            _AWS_ENV_MASK_FOR_DEFAULT_CHAIN,
+        )
+        assert "AWS_BEARER_TOKEN_BEDROCK" not in _AWS_ENV_MASK_FOR_API_KEY_COMPETING, (
+            "competing mask must EXCLUDE the bearer token — including it re-introduces "
+            "the build-time pop that caused NoAuthTokenError"
+        )
+        # Sanity: the competing mask is the full api_key mask minus the token.
+        assert set(_AWS_ENV_MASK_FOR_API_KEY_COMPETING) == (
+            set(_AWS_ENV_MASK_FOR_API_KEY) - {"AWS_BEARER_TOKEN_BEDROCK"}
+        )
+        # Documents the latent-race surface: these masks DO still pop the token.
+        assert "AWS_BEARER_TOKEN_BEDROCK" in _AWS_ENV_MASK_FOR_DEFAULT_CHAIN
+
 
 @pytest.mark.usefixtures("_isolate_claude_keychain")
 class TestReadClaudeCodeCredentials:
