@@ -630,6 +630,19 @@ _AWS_ENV_MASK_FOR_DEFAULT_CHAIN = (
     "AWS_BEARER_TOKEN_BEDROCK",
 )
 
+# api_key mode, COMPETING sources only — deliberately EXCLUDES
+# AWS_BEARER_TOKEN_BEDROCK. Used by the client builders after the bearer token
+# has been PERSISTED into os.environ (so botocore's request-time resolution can
+# see it). Masking the competing sources at build time prevents an explicit
+# access-key pair / profile / role / container-cred from shadowing the bearer
+# token, while the bearer token itself stays live in os.environ for the
+# lifetime of the client. Root-cause fix for the request-time-resolution
+# NoAuthTokenError cascade (2026-06-01) — see build_anthropic_bedrock_client
+# and _create_bedrock_client.
+_AWS_ENV_MASK_FOR_API_KEY_COMPETING = tuple(
+    k for k in _AWS_ENV_MASK_FOR_API_KEY if k != "AWS_BEARER_TOKEN_BEDROCK"
+)
+
 
 def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Return the name of the AWS auth source that is active, or None.
@@ -931,7 +944,16 @@ def _create_bedrock_client(service: str, region: str, auth_config: Dict[str, str
         extra_kwargs["endpoint_url"] = endpoint_url
 
     if method == "api_key":
-        with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY):
+        # Persist the bearer token into os.environ so botocore's REQUEST-TIME
+        # resolution can see it (boto resolves AWS_BEARER_TOKEN_BEDROCK lazily,
+        # not at client construction — verified 2026-06-01). Mask only the
+        # COMPETING auth sources during the build so they can't shadow the
+        # bearer token. Root-cause fix for the NoAuthTokenError fallback cascade
+        # (the previous mask popped the token before any request fired).
+        import os as _os
+        if auth_config.get("api_key"):
+            _os.environ["AWS_BEARER_TOKEN_BEDROCK"] = auth_config["api_key"]
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY_COMPETING):
             return boto3.client(service, region_name=region, config=_boto_cfg, **extra_kwargs)
 
     if method == "profile":
