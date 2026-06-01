@@ -1011,6 +1011,7 @@ def build_anthropic_bedrock_client(
         timeout = 900.0
     from agent.bedrock_adapter import (
         _AWS_ENV_MASK_FOR_API_KEY,
+        _AWS_ENV_MASK_FOR_API_KEY_COMPETING,
         _AWS_ENV_MASK_FOR_CREDENTIALS,
         _AWS_ENV_MASK_FOR_DEFAULT_CHAIN,
         _AWS_ENV_MASK_FOR_PROFILE,
@@ -1042,16 +1043,35 @@ def build_anthropic_bedrock_client(
     method = auth_config.get("method", "default_chain")
 
     if method == "api_key":
-        # SDK compat: anthropic>=0.86 rejects api_key= on AnthropicBedrock.
-        # The class wraps boto3, and botocore>=1.34.145 auto-discovers
-        # AWS_BEARER_TOKEN_BEDROCK from the process env. We set the env
-        # var here ONLY for the duration of the SDK call and restore prior
-        # state on exit. Without this scoping, mutating AWS_BEARER_TOKEN_BEDROCK
-        # in os.environ would leak to other concurrent threads / pooled
-        # gateway processes — see Code review P1-A (2026-05-24).
+        # SDK compat: anthropic>=0.86 rejects api_key= on AnthropicBedrock and
+        # exposes NO explicit bearer-token kwarg (verified anthropic 0.87.0:
+        # only aws_access_key/aws_secret_key/aws_session_token exist). The
+        # class wraps boto3, and botocore auto-discovers AWS_BEARER_TOKEN_BEDROCK
+        # from os.environ — but it resolves the token LAZILY AT REQUEST TIME,
+        # not at client-construction time.
+        #
+        # ROOT-CAUSE FIX (2026-06-01): the previous implementation set the env
+        # var INSIDE `with _masked_aws_env(...)` and returned the client from
+        # inside that block. The context manager then RESTORED the prior env on
+        # exit — popping the token back out BEFORE any request fired. Because
+        # botocore reads the token at request time, every .messages.create()
+        # raised NoAuthTokenError / "could not resolve credentials from
+        # session". This was the 292+ -occurrence fallback cascade: the primary
+        # survived only via a warm cached client; every fallback region rebuilt
+        # a fresh client and died. Empirically reproduced + fixed 2026-06-01.
+        #
+        # The token MUST remain in os.environ for the lifetime of the client so
+        # request-time resolution succeeds. We persist it (not scoped to the
+        # build window) and mask only the COMPETING auth sources during
+        # construction. The original P1-A thread-leak concern is moot for the
+        # bearer token specifically: in api_key mode every thread/pooled
+        # process in this interpreter authenticates with the SAME bearer token,
+        # so a shared os.environ value is correct, not a leak. Competing
+        # sources (access keys, profile, role, container creds) are still
+        # masked at build time so they cannot shadow the bearer token.
         import os as _os
-        with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY):
-            _os.environ["AWS_BEARER_TOKEN_BEDROCK"] = auth_config["api_key"]
+        _os.environ["AWS_BEARER_TOKEN_BEDROCK"] = auth_config["api_key"]
+        with _masked_aws_env(_AWS_ENV_MASK_FOR_API_KEY_COMPETING):
             return _anthropic_sdk.AnthropicBedrock(**kwargs)
 
     if method == "profile":
