@@ -622,7 +622,18 @@ _AWS_ENV_MASK_FOR_API_KEY = (
 )
 
 _AWS_ENV_MASK_FOR_PROFILE = (
-    "AWS_BEARER_TOKEN_BEDROCK",
+    # AWS_BEARER_TOKEN_BEDROCK deliberately NOT masked here. See the
+    # _AWS_ENV_MASK_FOR_API_KEY_COMPETING note + the 2026-06-01 council review:
+    # the api_key builders PERSIST the bearer token into os.environ for
+    # request-time resolution; if these other-method masks pop it during a
+    # concurrent build, an in-flight api_key request reads an empty token and
+    # raises NoAuthTokenError. Reproduced (186k/246k empty reads under
+    # contention). The token is a process-wide invariant in api_key mode, so it
+    # is never masked anywhere. A future IAM-creds user is protected by the
+    # explicit aws_access_key/aws_profile kwargs passed to the client (those
+    # win over a bearer token by SDK precedence) AND by the fail-closed
+    # assertion in resolve_bedrock_auth_config that refuses to mix IAM creds
+    # with api_key mode.
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -634,7 +645,7 @@ _AWS_ENV_MASK_FOR_PROFILE = (
 )
 
 _AWS_ENV_MASK_FOR_CREDENTIALS = (
-    "AWS_BEARER_TOKEN_BEDROCK",
+    # AWS_BEARER_TOKEN_BEDROCK deliberately NOT masked (see _AWS_ENV_MASK_FOR_PROFILE).
     "AWS_PROFILE",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
     "AWS_ROLE_ARN",
@@ -644,7 +655,9 @@ _AWS_ENV_MASK_FOR_CREDENTIALS = (
 )
 
 _AWS_ENV_MASK_FOR_DEFAULT_CHAIN = (
-    "AWS_BEARER_TOKEN_BEDROCK",
+    # AWS_BEARER_TOKEN_BEDROCK deliberately NOT masked (see _AWS_ENV_MASK_FOR_PROFILE).
+    # Intentionally empty: default_chain builds no longer pop the bearer token,
+    # so a concurrent api_key request never sees it blanked.
 )
 
 # api_key mode, COMPETING sources only — deliberately EXCLUDES
@@ -862,6 +875,42 @@ def resolve_bedrock_auth_config(
         if not token:
             raise RuntimeError(
                 "Bedrock auth_method=api_key requires AWS_BEARER_TOKEN_BEDROCK"
+            )
+        # B3 fail-closed guard (2026-06-01 council review): in api_key mode the
+        # bearer token is PERSISTED process-wide in os.environ and is no longer
+        # masked by the profile/credentials/default_chain builders (so a
+        # concurrent non-api_key build can't blank it — the NoAuthTokenError
+        # race). That safety rests on the invariant "no IAM creds coexist with
+        # api_key mode". If IAM creds DO appear, two things change: (1) a
+        # default_chain/profile/credentials client could be built at runtime,
+        # re-opening the mask race surface, and (2) the persisted bearer token
+        # could shadow the IAM creds the operator presumably now wants. Surface
+        # this loudly rather than silently proceeding on a violated invariant.
+        # Loud WARNING (not raise): single-tenant local agent, operator owns the
+        # consequences (§6.2); bricking a working agent over an unrelated
+        # `aws configure` would be worse than a visible warning.
+        _competing_iam = [
+            k for k in (
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_PROFILE",
+                "AWS_ROLE_ARN",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            )
+            if str(env.get(k) or "").strip()
+        ]
+        if _competing_iam:
+            logger.warning(
+                "Bedrock auth_method=api_key but competing IAM credential "
+                "source(s) present in env: %s. The bearer token is persisted "
+                "process-wide and unmasked; this re-opens the NoAuthTokenError "
+                "mask race and the bearer token may shadow your IAM creds. "
+                "Either remove auth_method=api_key (use the IAM creds) or unset "
+                "the IAM env vars. See bedrock_adapter mask comments + the "
+                "2026-06-01 council review.",
+                ", ".join(_competing_iam),
             )
         return {
             "method": "api_key",
