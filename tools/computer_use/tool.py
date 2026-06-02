@@ -159,10 +159,16 @@ def _get_backend() -> ComputerUseBackend:
             try:
                 _backend.start()
             except Exception:
-                # Don't cache a backend whose start() failed (e.g. a lazy
-                # dependency install was declined / failed). The next call
-                # retries cleanly instead of returning a half-initialised
-                # backend.
+                # Self-heal: if start() fails (e.g. cua-driver daemon was down at
+                # first-call time), DON'T leave a half-initialized backend cached.
+                # A cached-but-unstarted backend wedges every subsequent call with
+                # "session not started" for the whole process lifetime, because the
+                # `if _backend is None` guard above skips re-init. Reset to None so
+                # the NEXT call retries start() cleanly once the daemon is up.
+                try:
+                    _backend.stop()
+                except Exception:
+                    pass
                 _backend = None
                 raise
         return _backend
