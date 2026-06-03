@@ -4586,6 +4586,63 @@ def _run_npm_install_deterministic(
     )
 
 
+def _desktop_npm_candidate_node_version(npm_path: str) -> tuple[int, int, int] | None:
+    """Return the sibling Node.js version for an npm executable, if detectable."""
+    node = Path(npm_path).with_name("node")
+    if not node.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(node), "-e", "process.stdout.write(process.versions.node)"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        major = int(parts[0])
+        minor = int(parts[1])
+        patch = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError:
+        return None
+    return (major, minor, patch)
+
+
+def _resolve_desktop_npm() -> str | None:
+    """Pick an npm whose sibling Node can satisfy the Desktop dependency graph.
+
+    The root Hermes CLI can run on Node 22, but the public-preview Desktop
+    workspace currently resolves @icons-pack/react-simple-icons@13.13.0, whose
+    package metadata requires Node >=24. Prax's macOS PATH often has a Node 22
+    shim in ~/.local/bin before Homebrew's Node 26, so blindly using
+    shutil.which("npm") makes `hermes desktop` fail with EBADENGINE even though
+    a valid npm exists at /opt/homebrew/bin/npm.
+    """
+    candidates: list[str] = []
+    first = shutil.which("npm")
+    if first:
+        candidates.append(first)
+    for path in ("/opt/homebrew/bin/npm", "/usr/local/bin/npm"):
+        if Path(path).exists() and path not in candidates:
+            candidates.append(path)
+
+    fallback = candidates[0] if candidates else None
+    for candidate in candidates:
+        version = _desktop_npm_candidate_node_version(candidate)
+        if version and version >= (24, 0, 0):
+            return candidate
+    return fallback
+
+
 def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     """Build the web UI frontend if npm is available.
 
@@ -5150,11 +5207,17 @@ def cmd_gui(args: argparse.Namespace):
     packaged_executable = _desktop_packaged_executable(desktop_dir)
 
     if source_mode or not skip_build:
-        npm = shutil.which("npm")
+        npm = _resolve_desktop_npm()
         if not npm:
             print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
             print("Install Node.js, then run:  hermes gui")
             sys.exit(1)
+        # npm uses /usr/bin/env node, so selecting /opt/homebrew/bin/npm is not
+        # enough when ~/.local/bin/node appears earlier on PATH. Prepend the
+        # selected npm's bin dir so npm and node come from the same toolchain.
+        npm_bin = str(Path(npm).parent)
+        env["PATH"] = f"{npm_bin}{os.pathsep}{env.get('PATH', '')}"
+        os.environ["PATH"] = env["PATH"]
     else:
         npm = None
 
