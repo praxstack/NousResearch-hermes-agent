@@ -648,6 +648,13 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # A single legacy/corrupt TEXT cell should not brick /resume or the
+                # Desktop session browser. sqlite3's default text factory raises
+                # OperationalError during fetchall() on invalid UTF-8; decode with
+                # replacement so callers can still list sessions and repair data.
+                # (Originally landed in dfcd0fc86 against the inline connect block in
+                # __init__ — moved here when upstream extracted _connect_and_init.)
+                self._conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
                 apply_wal_with_fallback(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
