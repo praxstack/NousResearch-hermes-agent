@@ -523,7 +523,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
+                    # PRAX-PATCH 2026-06-04: do NOT call _anthropic_client.close()
+                    # here — closing the SHARED client mid-create() tears the
+                    # httpx/urllib3 pool out from under any concurrent session
+                    # and raises AssertionErrors (same council-flagged anti-
+                    # pattern fixed on the streaming path). _rebuild swaps in a
+                    # fresh client for the worker's retry by reassigning the
+                    # reference; the old client's in-flight create() drains via
+                    # the (now 360s) read timeout. Never close the shared client.
                     agent._rebuild_anthropic_client()
                 else:
                     _close_request_client_once("stale_call_kill")
@@ -562,7 +569,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # seed future retries.
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
+                    # PRAX-PATCH 2026-06-04: rebuild (reassign) the shared
+                    # client for future retries WITHOUT calling .close() on it
+                    # first — closing it mid-create() poisons the pool for
+                    # concurrent sessions (AssertionError), the exact thing the
+                    # comment above says we must avoid. The interrupt is still
+                    # honored: we raise InterruptedError below; the abandoned
+                    # worker's create() drains via the read timeout.
                     agent._rebuild_anthropic_client()
                 else:
                     _close_request_client_once("interrupt_abort")
