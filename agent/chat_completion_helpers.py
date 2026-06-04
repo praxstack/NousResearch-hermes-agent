@@ -1734,6 +1734,57 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
+    # ── Anthropic (AnthropicBedrock / anthropic_messages) stream abort ──
+    # PRAX-PATCH 2026-06-04 (council-reviewed): on the anthropic_messages
+    # transport, _call_anthropic streams via the SDK's MessageStream context
+    # manager and never registers an OpenAI request client.  The old stale
+    # detector therefore called _close_request_client_once() — a NO-OP on this
+    # path — so a stalled Bedrock-Claude stream was never aborted and hung
+    # until the 900s httpx read timeout.  We register the live MessageStream
+    # here so the watchdog thread can close the *response* (not the shared
+    # _anthropic_client, which would tear the pool out from under concurrent
+    # sessions and raise AssertionErrors).  httpcore 1.0.9 close() is
+    # lock-free and the blocked read holds no _state_lock, so a cross-thread
+    # close on the HTTP/1.1 socket safely unblocks the worker's iteration.
+    #   holder slot:  request_client_holder["anthropic_stream"]
+    #   abort reason: request_client_holder["abort_reason"]  ("stale"|"interrupt"|None)
+    request_client_holder["anthropic_stream"] = None
+    request_client_holder["abort_reason"] = None  # type: ignore[assignment]  # "stale"|"interrupt"|None at runtime
+
+    def _register_anthropic_stream(stream) -> None:
+        with request_client_lock:
+            request_client_holder["anthropic_stream"] = stream
+
+    def _clear_anthropic_stream() -> None:
+        with request_client_lock:
+            request_client_holder["anthropic_stream"] = None
+
+    def _close_anthropic_stream_once(reason: str) -> None:
+        """Abort the in-flight Anthropic MessageStream from any thread.
+
+        Reads-and-nulls the holder under the lock (so at most one caller
+        gets the live handle — no TOCTOU), records the abort reason for the
+        worker's retry classifier, then calls ``stream.close()`` OUTSIDE the
+        lock (never do I/O under a lock the worker may also need).  Closing
+        the SDK MessageStream closes only this response/connection — NOT the
+        shared client.  Idempotent and exception-safe.
+        """
+        with request_client_lock:
+            stream = request_client_holder.get("anthropic_stream")
+            request_client_holder["anthropic_stream"] = None
+            # Record reason so the worker's except clause can distinguish a
+            # watchdog/interrupt abort (route to retry / clean stop) from a
+            # genuine upstream network error.
+            request_client_holder["abort_reason"] = reason
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except Exception:
+            logger.debug(
+                "anthropic stream close suppressed (%s)", reason, exc_info=True
+            )
+
     first_delta_fired = {"done": False}
     deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
     # Wall-clock timestamp of the last real streaming chunk.  The outer
@@ -2128,70 +2179,83 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         )
         # Use the Anthropic SDK's streaming context manager
         with agent._anthropic_client.messages.stream(**api_kwargs) as stream:
-            # The Anthropic SDK exposes the raw httpx response on
-            # ``stream.response``.  Snapshot diagnostic headers
-            # immediately so they survive a stream that dies before the
-            # first event.
+            # PRAX-PATCH 2026-06-04: register the live MessageStream so the
+            # outer poll loop (stale detector / interrupt) can abort THIS
+            # response from another thread via stream.close().  Registered
+            # right after __enter__ (stream fully initialized) and cleared in
+            # finally so no dead handle leaks across attempts.  If the
+            # watchdog fires in the gap before registration, it sees None and
+            # no-ops for this cycle — acceptable, the stream just opened.
+            _register_anthropic_stream(stream)
             try:
-                agent._stream_diag_capture_response(
-                    _diag, getattr(stream, "response", None)
-                )
-            except Exception:
-                pass
-            for event in stream:
-                # Update stale-stream timer on every event so the
-                # outer poll loop knows data is flowing.  Without
-                # this, the detector kills healthy long-running
-                # Opus streams after 180 s even when events are
-                # actively arriving (the chat_completions path
-                # already does this at the top of its chunk loop).
-                last_chunk_time["t"] = time.time()
-                agent._touch_activity("receiving stream response")
-
-                # Update per-attempt diagnostic counters (best-effort).
+                # The Anthropic SDK exposes the raw httpx response on
+                # ``stream.response``.  Snapshot diagnostic headers
+                # immediately so they survive a stream that dies before the
+                # first event.
                 try:
-                    _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
-                    if _diag.get("first_chunk_at") is None:
-                        _diag["first_chunk_at"] = last_chunk_time["t"]
-                    try:
-                        _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(event))
-                    except Exception:
-                        pass
+                    agent._stream_diag_capture_response(
+                        _diag, getattr(stream, "response", None)
+                    )
                 except Exception:
                     pass
+                for event in stream:
+                    # Update stale-stream timer on every event so the
+                    # outer poll loop knows data is flowing.  Without
+                    # this, the detector kills healthy long-running
+                    # Opus streams after 180 s even when events are
+                    # actively arriving (the chat_completions path
+                    # already does this at the top of its chunk loop).
+                    last_chunk_time["t"] = time.time()
+                    agent._touch_activity("receiving stream response")
 
-                if agent._interrupt_requested:
-                    break
+                    # Update per-attempt diagnostic counters (best-effort).
+                    try:
+                        _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
+                        if _diag.get("first_chunk_at") is None:
+                            _diag["first_chunk_at"] = last_chunk_time["t"]
+                        try:
+                            _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(event))
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
 
-                event_type = getattr(event, "type", None)
+                    if agent._interrupt_requested:
+                        break
 
-                if event_type == "content_block_start":
-                    block = getattr(event, "content_block", None)
-                    if block and getattr(block, "type", None) == "tool_use":
-                        has_tool_use = True
-                        tool_name = getattr(block, "name", None)
-                        if tool_name:
-                            _fire_first_delta()
-                            agent._fire_tool_gen_started(tool_name)
+                    event_type = getattr(event, "type", None)
 
-                elif event_type == "content_block_delta":
-                    delta = getattr(event, "delta", None)
-                    if delta:
-                        delta_type = getattr(delta, "type", None)
-                        if delta_type == "text_delta":
-                            text = getattr(delta, "text", "")
-                            if text and not has_tool_use:
+                    if event_type == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if block and getattr(block, "type", None) == "tool_use":
+                            has_tool_use = True
+                            tool_name = getattr(block, "name", None)
+                            if tool_name:
                                 _fire_first_delta()
-                                agent._fire_stream_delta(text)
-                                deltas_were_sent["yes"] = True
-                        elif delta_type == "thinking_delta":
-                            thinking_text = getattr(delta, "thinking", "")
-                            if thinking_text:
-                                _fire_first_delta()
-                                agent._fire_reasoning_delta(thinking_text)
+                                agent._fire_tool_gen_started(tool_name)
 
-            # Return the native Anthropic Message for downstream processing
-            return stream.get_final_message()
+                    elif event_type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            delta_type = getattr(delta, "type", None)
+                            if delta_type == "text_delta":
+                                text = getattr(delta, "text", "")
+                                if text and not has_tool_use:
+                                    _fire_first_delta()
+                                    agent._fire_stream_delta(text)
+                                    deltas_were_sent["yes"] = True
+                            elif delta_type == "thinking_delta":
+                                thinking_text = getattr(delta, "thinking", "")
+                                if thinking_text:
+                                    _fire_first_delta()
+                                    agent._fire_reasoning_delta(thinking_text)
+
+                # Return the native Anthropic Message for downstream processing
+                return stream.get_final_message()
+            finally:
+                # Always clear the registered handle so a later attempt /
+                # the watchdog never closes a dead stream from this attempt.
+                _clear_anthropic_stream()
 
     def _call():
         import httpx as _httpx
@@ -2216,6 +2280,61 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_chat_completions()
                     return  # success
                 except Exception as e:
+                    # PRAX-PATCH 2026-06-04: watchdog/interrupt abort routing.
+                    # When the outer poll loop closes the Anthropic stream via
+                    # _close_anthropic_stream_once(), the worker's iteration
+                    # raises httpx.ReadError (bare socket close) — which falls
+                    # through the network-error classifier below (ReadError is
+                    # neither in _is_timeout's tuple nor _is_conn_err's). The
+                    # abort_reason sentinel disambiguates a deliberate abort
+                    # from a genuine upstream failure so we route correctly.
+                    _abort_reason = None
+                    with request_client_lock:
+                        _abort_reason = request_client_holder.get("abort_reason")
+                        request_client_holder["abort_reason"] = None
+                    if _abort_reason == "interrupt":
+                        # User /stop while streaming: do NOT retry; surface as
+                        # a clean interrupt so the conversation loop stops.
+                        raise InterruptedError(
+                            "Agent interrupted during streaming API call"
+                        ) from e
+                    if _abort_reason == "stale":
+                        # Watchdog aborted a stalled stream. Treat as a
+                        # transient failure and retry with a fresh stream,
+                        # resetting per-attempt accumulators so the retry's
+                        # preamble/thinking doesn't double-record (mirrors the
+                        # mid-tool-call retry reset path below).
+                        if _stream_attempt < _max_stream_retries:
+                            agent._emit_stream_drop(
+                                error=e,
+                                attempt=_stream_attempt + 2,
+                                max_attempts=_max_stream_retries + 1,
+                                mid_tool_call=False,
+                                diag=request_client_holder.get("diag"),
+                            )
+                            try:
+                                agent._reset_stream_delivery_tracking()
+                            except Exception:
+                                pass
+                            result["partial_tool_names"] = []
+                            deltas_were_sent["yes"] = False
+                            first_delta_fired["done"] = False
+                            logger.warning(
+                                "Anthropic stream aborted by stale-detector "
+                                "(attempt %d/%d) — retrying with fresh stream.",
+                                _stream_attempt + 1, _max_stream_retries + 1,
+                            )
+                            continue
+                        # Retries exhausted on a stale stream: fall through to
+                        # surface the error to the main loop (provider
+                        # fallback / final stub).
+                        logger.warning(
+                            "Anthropic stream stale-aborted and retries "
+                            "exhausted (%d) — surfacing error.",
+                            _max_stream_retries + 1,
+                        )
+                        result["error"] = e
+                        return
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the
                     # expected consequence of our own close — NOT a transient
@@ -2539,16 +2658,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 f"context: ~{_est_ctx:,} tokens). "
                 f"Reconnecting..."
             )
-            try:
-                _close_request_client_once("stale_stream_kill")
-            except Exception:
-                pass
-            # Rebuild the primary client too — its connection pool
-            # may hold dead sockets from the same provider outage.
-            try:
-                agent._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
-            except Exception:
-                pass
+            # PRAX-PATCH 2026-06-04: on the anthropic_messages transport the
+            # OpenAI-style _close_request_client_once is a NO-OP (no client was
+            # ever registered). Close the live MessageStream response instead —
+            # that actually aborts the worker's blocked read so it can retry
+            # with a fresh stream (the abort_reason="stale" sentinel routes the
+            # worker's resulting ReadError into the retry path). Do NOT touch
+            # the shared _anthropic_client.
+            if agent.api_mode == "anthropic_messages":
+                try:
+                    _close_anthropic_stream_once("stale")
+                except Exception:
+                    pass
+            else:
+                try:
+                    _close_request_client_once("stale_stream_kill")
+                except Exception:
+                    pass
+                # Rebuild the primary client too — its connection pool
+                # may hold dead sockets from the same provider outage.
+                try:
+                    agent._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
+                except Exception:
+                    pass
             # Reset the timer so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
@@ -2568,8 +2700,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
-                    agent._rebuild_anthropic_client()
+                    # PRAX-PATCH 2026-06-04: abort THIS stream's response, not
+                    # the shared client. The previous code called
+                    # agent._anthropic_client.close() + _rebuild — closing the
+                    # shared client mid-stream tears the httpx/urllib3 pool out
+                    # from under any concurrent session and raises
+                    # AssertionErrors (council-flagged). The abort_reason=
+                    # "interrupt" sentinel makes the worker surface a clean
+                    # InterruptedError instead of retrying.
+                    _close_anthropic_stream_once("interrupt")
                 else:
                     _close_request_client_once("stream_interrupt_abort")
             except Exception:
