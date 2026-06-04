@@ -734,6 +734,25 @@ def _common_betas_for_base_url(
     return betas
 
 
+def _anthropic_default_read_timeout() -> float:
+    """Default httpx read timeout (s) for the Anthropic/AnthropicBedrock client.
+
+    PRAX-PATCH 2026-06-04 (council belt-and-suspenders): lowered from a
+    hardcoded 900s to an env-overridable 360s. The primary stall fix is the
+    cross-thread MessageStream.close() abort in chat_completion_helpers
+    (stale-detector fires ~300s); this read timeout is the FALLBACK for the
+    rare case where a wedged socket doesn't unblock on close. 360s > the
+    300s stale threshold so the watchdog gets first crack; if it somehow
+    fails, the read still dies at 360s instead of 900s. Override with
+    HERMES_ANTHROPIC_READ_TIMEOUT for slow/local endpoints.
+    """
+    try:
+        v = float(os.getenv("HERMES_ANTHROPIC_READ_TIMEOUT", "360.0"))
+        return v if v > 0 else 360.0
+    except (TypeError, ValueError):
+        return 360.0
+
+
 def _build_anthropic_client_with_bearer_hook(
     token_provider,
     base_url: str = None,
@@ -769,7 +788,7 @@ def _build_anthropic_client_with_bearer_hook(
     from httpx import Timeout
     from agent.azure_identity_adapter import build_bearer_http_client
 
-    _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
+    _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else _anthropic_default_read_timeout()
     timeout_obj = Timeout(timeout=float(_read_timeout), connect=10.0)
 
     # Strip any trailing /v1 — the Anthropic SDK appends /v1/messages.
@@ -861,12 +880,12 @@ def build_anthropic_client(
     try:
         from httpx import Timeout
 
-        timeout = Timeout(timeout=900.0, connect=10.0)
+        timeout = Timeout(timeout=_anthropic_default_read_timeout(), connect=10.0)
     except ImportError:
-        timeout = 900.0
+        timeout = _anthropic_default_read_timeout()
 
     normalized_base_url = _normalize_base_url_text(base_url)
-    _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
+    _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else _anthropic_default_read_timeout()
     kwargs = {
         "timeout": Timeout(timeout=float(_read_timeout), connect=10.0),
     }
@@ -966,9 +985,9 @@ def build_anthropic_bedrock_client(
     try:
         from httpx import Timeout
 
-        timeout = Timeout(timeout=900.0, connect=10.0)
+        timeout = Timeout(timeout=_anthropic_default_read_timeout(), connect=10.0)
     except ImportError:
-        timeout = 900.0
+        timeout = _anthropic_default_read_timeout()
     from agent.bedrock_adapter import (
         _AWS_ENV_MASK_FOR_API_KEY,
         _AWS_ENV_MASK_FOR_API_KEY_COMPETING,
