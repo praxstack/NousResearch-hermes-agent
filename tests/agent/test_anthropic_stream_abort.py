@@ -211,3 +211,31 @@ def test_abort_reason_sentinel_routing_present():
     assert 'request_client_holder.get("abort_reason")' in src
     assert '_abort_reason == "interrupt"' in src
     assert '_abort_reason == "stale"' in src
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# PRAX-PATCH 2026-06-04 (default session, ownership review): the NON-STREAM
+# anthropic path (_call inside interruptible_api_call) must ALSO never close
+# the shared _anthropic_client — same anti-pattern the streaming fix removed.
+# This guards against a future edit reintroducing it on either path.
+# ─────────────────────────────────────────────────────────────────────────
+def test_no_shared_anthropic_client_close_anywhere_in_helpers():
+    """Source-level guard: zero LIVE agent._anthropic_client.close() calls in
+    chat_completion_helpers (comments referencing the old pattern are fine).
+    Both the streaming and non-streaming anthropic abort paths must rebuild
+    the shared client, never close it mid-request (pool-poison / AssertionError).
+    """
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(here, "agent", "chat_completion_helpers.py")
+    with open(path, encoding="utf-8") as fh:
+        code_lines = [
+            ln for ln in fh.read().splitlines()
+            if not ln.lstrip().startswith("#")
+        ]
+    code = "\n".join(code_lines)
+    assert "_anthropic_client.close()" not in code, (
+        "Found a LIVE agent._anthropic_client.close() call — closing the shared "
+        "client mid-request poisons the pool for concurrent sessions. Rebuild "
+        "(reassign) the client instead; never close it."
+    )
