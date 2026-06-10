@@ -2034,7 +2034,7 @@ class CLICommandsMixin:
 
         Usage:
             /reasoning              Show current effort level and display state
-            /reasoning <level>      Set reasoning effort (none, minimal, low, medium, high, xhigh)
+            /reasoning <level>      Set reasoning effort (none, low, medium, high, xhigh, max)
             /reasoning show|on      Show model thinking/reasoning in output
             /reasoning hide|off     Hide model thinking/reasoning from output
         """
@@ -2053,7 +2053,16 @@ class CLICommandsMixin:
             display_state = "on ✓" if self.show_reasoning else "off"
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state}{_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|show|hide>{_RST}")
+            # Show the levels actually valid for the ACTIVE model when known.
+            _usage_levels = "none|low|medium|high|xhigh|max"
+            try:
+                from agent.anthropic_adapter import valid_efforts_for_model
+                _av = valid_efforts_for_model(getattr(self, "model", "") or "")
+                if _av is not None:
+                    _usage_levels = "|".join(_av)
+            except Exception:
+                pass
+            _cprint(f"  {_DIM}Usage: /reasoning <{_usage_levels}|show|hide>{_RST}")
             return
 
         arg = parts[1].strip().lower()
@@ -2079,9 +2088,38 @@ class CLICommandsMixin:
         parsed = _parse_reasoning_config(arg)
         if parsed is None:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh{_RST}")
+            _cprint(f"  {_DIM}Valid levels: none, low, medium, high, xhigh, max{_RST}")
             _cprint(f"  {_DIM}Display:      show, hide{_RST}")
             return
+
+        # Family-aware validity: reject an effort the ACTIVE model would 400 on
+        # (e.g. xhigh on Sonnet 4.6, any thinking on Haiku 4.5, or 'minimal' on
+        # the Bedrock adaptive path) BEFORE it reaches the wire. Derived from the
+        # same guards the request path uses, so command and wire stay in lock-step.
+        try:
+            from agent.anthropic_adapter import (
+                valid_efforts_for_model,
+                is_effort_valid_for_model,
+            )
+            _active_model = getattr(self, "model", "") or ""
+            _allowed = valid_efforts_for_model(_active_model)
+            # _allowed is None for non-Claude providers → unconstrained (no regression).
+            if _allowed is not None and not is_effort_valid_for_model(arg, _active_model):
+                _cprint(
+                    f"  {_DIM}(._.) '{arg}' is not supported by the active model "
+                    f"({_active_model}).{_RST}"
+                )
+                _cprint(f"  {_ACCENT}Supported levels: {', '.join(_allowed)}{_RST}")
+                if _allowed == ["none"]:
+                    _cprint(
+                        f"  {_DIM}  This model has no adaptive thinking — use "
+                        f"'/reasoning none', or switch model with /model.{_RST}"
+                    )
+                return
+        except Exception:
+            # Never block the command on a guard import/logic error — fall through
+            # to the existing behavior (the wire still enforces correctness).
+            pass
 
         self.reasoning_config = parsed
         self.agent = None  # Force agent re-init with new reasoning config
