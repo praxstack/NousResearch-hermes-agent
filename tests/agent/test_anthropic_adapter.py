@@ -2665,3 +2665,59 @@ class TestConvertToolsToAnthropicDedup:
 
     def test_none_tools_returns_empty(self):
         assert convert_tools_to_anthropic(None) == []
+
+
+class TestValidEffortsForModel:
+    """Family-aware reasoning-effort validity (PR-2 Atom A, 2026-06-10).
+
+    Live-verified Bedrock adaptive-thinking effort matrix (probed 2026-06-10):
+      Opus-4.8 / Fable-5: max xhigh high medium low none   (NO minimal)
+      Sonnet-4.6        : max high medium low none          (NO xhigh, NO minimal)
+      Haiku-4.5         : none ONLY                          (rejects all thinking)
+      non-Claude        : None (unconstrained — no regression)
+    'minimal' is REJECTED by all Bedrock-Claude families (400) despite the
+    legacy ADAPTIVE_EFFORT_MAP alias, so it is never in the offered set.
+    """
+
+    def _f(self):
+        from agent.anthropic_adapter import valid_efforts_for_model
+        return valid_efforts_for_model
+
+    def test_opus_4_8_full_set(self):
+        v = self._f()("us.anthropic.claude-opus-4-8")
+        assert v == ["none", "low", "medium", "high", "xhigh", "max"]
+
+    def test_fable_5_full_set(self):
+        v = self._f()("us.anthropic.claude-fable-5")
+        assert "xhigh" in v and "max" in v and "none" in v
+        assert "minimal" not in v
+
+    def test_sonnet_4_6_no_xhigh(self):
+        v = self._f()("global.anthropic.claude-sonnet-4-6")
+        assert "xhigh" not in v, "Sonnet 4.6 rejects xhigh"
+        assert v == ["none", "low", "medium", "high", "max"]
+
+    def test_haiku_4_5_none_only(self):
+        v = self._f()("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        assert v == ["none"], "Haiku 4.5 rejects all thinking"
+
+    def test_minimal_never_offered(self):
+        for m in ["us.anthropic.claude-opus-4-8", "us.anthropic.claude-fable-5",
+                  "global.anthropic.claude-sonnet-4-6"]:
+            assert "minimal" not in self._f()(m), f"minimal must not be offered for {m}"
+
+    def test_non_claude_unconstrained(self):
+        # Non-Claude models: return None = "don't constrain" (no regression for
+        # openrouter/gpt/nova which have their own effort handling).
+        assert self._f()("gpt-5.5") is None
+        assert self._f()("us.amazon.nova-pro-v1:0") is None
+
+    def test_is_effort_valid_helper(self):
+        from agent.anthropic_adapter import is_effort_valid_for_model
+        assert is_effort_valid_for_model("xhigh", "us.anthropic.claude-opus-4-8") is True
+        assert is_effort_valid_for_model("xhigh", "global.anthropic.claude-sonnet-4-6") is False
+        assert is_effort_valid_for_model("high", "us.anthropic.claude-haiku-4-5-20251001-v1:0") is False
+        assert is_effort_valid_for_model("none", "us.anthropic.claude-haiku-4-5-20251001-v1:0") is True
+        assert is_effort_valid_for_model("minimal", "us.anthropic.claude-opus-4-8") is False
+        # Non-Claude: permissive (always valid — no constraint)
+        assert is_effort_valid_for_model("xhigh", "gpt-5.5") is True
