@@ -2042,41 +2042,64 @@ class CLICommandsMixin:
             return
 
         # Family-aware validity: reject an effort the ACTIVE model would 400 on
-        # (e.g. xhigh on Sonnet 4.6, any thinking on Haiku 4.5, or 'minimal' on
-        # the Bedrock adaptive path) BEFORE it reaches the wire. Derived from the
-        # same guards the request path uses, so command and wire stay in lock-step.
-        try:
-            from agent.anthropic_adapter import (
-                valid_efforts_for_model,
-                is_effort_valid_for_model,
-            )
-            _active_model = getattr(self, "model", "") or ""
-            _allowed = valid_efforts_for_model(_active_model)
-            # _allowed is None for non-Claude providers → unconstrained (no regression).
-            if _allowed is not None and not is_effort_valid_for_model(arg, _active_model):
-                _cprint(
-                    f"  {_DIM}(._.) '{arg}' is not supported by the active model "
-                    f"({_active_model}).{_RST}"
+        # (e.g. xhigh on Sonnet 4.6, any thinking on Haiku 4.5) BEFORE it reaches
+        # the wire. Derived from the same guards the request path uses so command
+        # and wire stay in lock-step.
+        #
+        # Council C5 fix: the legacy 'minimal' alias must STILL be accepted —
+        # ADAPTIVE_EFFORT_MAP coerces minimal->low at the wire, and rejecting it
+        # here would be a behavior regression for existing configs/scripts. So we
+        # resolve the alias to its CANONICAL effort, validate THAT, and persist
+        # the canonical value (so 'minimal' is stored as 'low', matching the wire).
+        effective_arg = arg
+        _active_model = getattr(self, "model", "") or ""
+        if _active_model:
+            try:
+                from agent.anthropic_adapter import (
+                    valid_efforts_for_model,
+                    is_effort_valid_for_model,
+                    ADAPTIVE_EFFORT_MAP,
                 )
-                _cprint(f"  {_ACCENT}Supported levels: {', '.join(_allowed)}{_RST}")
-                if _allowed == ["none"]:
-                    _cprint(
-                        f"  {_DIM}  This model has no adaptive thinking — use "
-                        f"'/reasoning none', or switch model with /model.{_RST}"
+                _allowed = valid_efforts_for_model(_active_model)
+                # None => non-Claude / unconstrained provider (no regression).
+                if _allowed is not None:
+                    _canon = ADAPTIVE_EFFORT_MAP.get(arg, arg)
+                    if not is_effort_valid_for_model(_canon, _active_model):
+                        _cprint(
+                            f"  {_DIM}(._.) '{arg}' is not supported by the active "
+                            f"model ({_active_model}).{_RST}"
+                        )
+                        _cprint(f"  {_ACCENT}Supported levels: {', '.join(_allowed)}{_RST}")
+                        if _allowed == ["none"]:
+                            _cprint(
+                                f"  {_DIM}  This model has no adaptive thinking — use "
+                                f"'/reasoning none', or switch model with /model.{_RST}"
+                            )
+                        return
+                    # Accepted — persist the canonical effort (minimal -> low).
+                    if _canon != arg:
+                        _recanon = _parse_reasoning_config(_canon)
+                        if _recanon is not None:
+                            parsed = _recanon
+                            effective_arg = _canon
+            except Exception as _guard_exc:
+                # The wire still enforces correctness; never block the command on a
+                # guard import/logic error, but leave a debug breadcrumb (council C2).
+                try:
+                    import logging
+                    logging.getLogger("hermes.cli").debug(
+                        "reasoning effort guard skipped: %r", _guard_exc
                     )
-                return
-        except Exception:
-            # Never block the command on a guard import/logic error — fall through
-            # to the existing behavior (the wire still enforces correctness).
-            pass
+                except Exception:
+                    pass
 
         self.reasoning_config = parsed
         self.agent = None  # Force agent re-init with new reasoning config
 
-        if save_config_value("agent.reasoning_effort", arg):
-            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (saved to config){_RST}")
+        if save_config_value("agent.reasoning_effort", effective_arg):
+            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{effective_arg}' (saved to config){_RST}")
         else:
-            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
+            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{effective_arg}' (session only){_RST}")
 
     def _handle_busy_command(self, cmd: str):
         """Handle /busy — control what Enter does while Hermes is working.
