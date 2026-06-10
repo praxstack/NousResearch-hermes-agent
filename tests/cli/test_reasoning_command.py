@@ -816,9 +816,13 @@ class TestReasoningFamilyAwareValidation(unittest.TestCase):
         self.assertFalse(applied, "thinking must NOT be applied on Haiku 4.5")
         self.assertIn("none", out.lower())
 
-    def test_minimal_rejected_on_opus(self):
+    def test_minimal_coerced_not_rejected_on_opus(self):
+        # Council C5: 'minimal' is a legacy alias (ADAPTIVE_EFFORT_MAP minimal->low).
+        # It must be ACCEPTED (coerced to low), NOT rejected — rejecting it would
+        # regress existing configs/scripts. (Superseded the original reject assertion.)
         applied, out = self._run("us.anthropic.claude-opus-4-8", "minimal")
-        self.assertFalse(applied, "'minimal' must be rejected on the adaptive path")
+        self.assertTrue(applied, "'minimal' must be accepted (coerced to low), not rejected")
+        self.assertNotIn("not supported", out.lower())
 
     def test_xhigh_accepted_on_opus(self):
         applied, _ = self._run("us.anthropic.claude-opus-4-8", "xhigh")
@@ -836,3 +840,71 @@ class TestReasoningFamilyAwareValidation(unittest.TestCase):
         # gpt model: valid_efforts_for_model returns None -> no family gate
         applied, _ = self._run("gpt-5.5", "xhigh")
         self.assertTrue(applied, "non-Claude models must not be constrained by the family gate")
+
+
+class TestReasoningMinimalAliasCoercion(unittest.TestCase):
+    """PR-2 council C5 fix: 'minimal' must remain accepted (coerced to 'low')
+    on Bedrock-Claude, not rejected by the new family-aware guard.
+
+    Before PR-2, /reasoning minimal parsed OK and the wire mapped minimal->low.
+    The family guard must normalize the legacy 'minimal' alias to 'low' BEFORE
+    validating, so existing configs / muscle memory / scripts don't break.
+    """
+
+    def _make_cli(self, model):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        cli = CLICommandsMixin.__new__(CLICommandsMixin)
+        cli.model = model
+        cli.provider = "bedrock"
+        cli.reasoning_config = None
+        cli.show_reasoning = False
+        cli.agent = MagicMock()
+        return cli
+
+    def _run(self, model, arg):
+        cli = self._make_cli(model)
+        captured = []
+        with patch("cli._cprint", side_effect=lambda *a, **k: captured.append(a[0] if a else "")), \
+             patch("cli.save_config_value", return_value=False):
+            cli._handle_reasoning_command(f"/reasoning {arg}")
+        return cli.reasoning_config, "\n".join(str(c) for c in captured)
+
+    def test_minimal_coerced_to_low_on_opus(self):
+        rc, out = self._run("us.anthropic.claude-opus-4-8", "minimal")
+        self.assertIsNotNone(rc, "minimal must NOT be rejected (legacy alias)")
+        self.assertEqual(rc.get("effort"), "low", "minimal must coerce to low")
+        self.assertNotIn("not supported", out.lower())
+
+    def test_minimal_coerced_to_low_on_sonnet(self):
+        rc, _ = self._run("global.anthropic.claude-sonnet-4-6", "minimal")
+        self.assertIsNotNone(rc)
+        self.assertEqual(rc.get("effort"), "low")
+
+    def test_minimal_rejected_on_haiku(self):
+        # Haiku only supports 'none'. minimal->low is still invalid -> reject.
+        rc, out = self._run("us.anthropic.claude-haiku-4-5-20251001-v1:0", "minimal")
+        self.assertIsNone(rc, "minimal->low is still unsupported on Haiku")
+        self.assertIn("none", out.lower())
+
+
+class TestReasoningEmptyModelEarlyExit(unittest.TestCase):
+    """PR-2 council C3 fix: guard must not misfire when no model is set yet."""
+
+    def _make_cli(self, model):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        cli = CLICommandsMixin.__new__(CLICommandsMixin)
+        cli.model = model
+        cli.provider = ""
+        cli.reasoning_config = None
+        cli.show_reasoning = False
+        cli.agent = MagicMock()
+        return cli
+
+    def test_empty_model_accepts_any_effort(self):
+        # No active model -> unconstrained (wire enforces). Must not crash/reject.
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        cli = self._make_cli("")
+        with patch("cli._cprint", side_effect=lambda *a, **k: None), \
+             patch("cli.save_config_value", return_value=False):
+            cli._handle_reasoning_command("/reasoning xhigh")
+        self.assertIsNotNone(cli.reasoning_config, "empty model must not block effort set")
