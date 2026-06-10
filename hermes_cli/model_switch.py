@@ -390,6 +390,31 @@ def resolve_persist_behavior(is_global: bool, is_session: bool) -> bool:
     return True
 
 
+def resolve_current_model_index(model_list, current_model) -> int:
+    """Return the index of *current_model* in *model_list*, else 0.
+
+    Used by the /model picker to default the model-stage highlight to the
+    model the user is already running, so pressing Enter without arrowing is a
+    no-op instead of switching to whatever sits at index 0. When the current
+    model is absent from the list (region pulled, id renamed, revoked
+    mid-session) we fall back to 0 — which is safe because the list is ordered
+    Claude-first (a Claude Opus, not a tiny utility model, sits there).
+
+    Matching is case-insensitive and whitespace-stripped because the live
+    picker list and the session's ``self.model`` can differ in case/padding.
+    Pure, total, never raises.
+    """
+    if not model_list:
+        return 0
+    target = str(current_model or "").strip().lower()
+    if not target:
+        return 0
+    for i, mid in enumerate(model_list):
+        if str(mid or "").strip().lower() == target:
+            return i
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution
 # ---------------------------------------------------------------------------
