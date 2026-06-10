@@ -389,6 +389,60 @@ def _supports_xhigh_effort(model: str) -> bool:
     return not any(v in m for v in _NO_XHIGH_CLAUDE_SUBSTRINGS)
 
 
+# Canonical adaptive-thinking effort levels, ordered weakest→strongest, that
+# AWS Bedrock actually accepts on the adaptive path (live-verified 2026-06-10).
+# NOTE: "minimal" is NOT here — Bedrock 400s on output_config.effort="minimal"
+# for every Claude family, despite ADAPTIVE_EFFORT_MAP aliasing minimal→low for
+# callers that still pass it. "none" means "omit the thinking block entirely".
+_ADAPTIVE_EFFORT_LEVELS_ORDERED = ("none", "low", "medium", "high", "xhigh", "max")
+
+
+def valid_efforts_for_model(model: str):
+    """Return the reasoning-effort levels a model accepts, weakest→strongest.
+
+    Family-aware, derived from the same guards the request path uses so the
+    picker/command and the wire stay in lock-step (live-verified Bedrock matrix
+    2026-06-10):
+
+      - Opus 4.7+/4.8, Fable/Mythos (adaptive + xhigh): all six levels.
+      - Sonnet/Opus 4.6 (adaptive, no xhigh): all except "xhigh".
+      - Haiku 4.5 and other legacy Claude (no adaptive thinking on Bedrock):
+        ["none"] only — they reject every thinking/effort field.
+      - Non-Claude models (gpt, nova, deepseek, …): return None meaning
+        "do not constrain" — those providers manage effort their own way and
+        must not regress.
+
+    "minimal" is never returned (Bedrock rejects it on the adaptive path).
+    """
+    if not _is_claude_model(model):
+        return None  # unconstrained — non-Claude providers handle effort themselves
+    if not _supports_adaptive_thinking(model):
+        # Legacy Claude on the modern (4.7+ adaptive-only) wire = Haiku 4.5 and
+        # older families. On Bedrock these reject the adaptive thinking block,
+        # so the only safe choice is to omit it ("none").
+        return ["none"]
+    levels = [lvl for lvl in _ADAPTIVE_EFFORT_LEVELS_ORDERED if lvl != "xhigh"]
+    if _supports_xhigh_effort(model):
+        # insert xhigh between high and max to preserve weakest→strongest order
+        idx = levels.index("max")
+        levels = levels[:idx] + ["xhigh"] + levels[idx:]
+    return levels
+
+
+def is_effort_valid_for_model(effort: str, model: str) -> bool:
+    """True if `effort` is an accepted reasoning level for `model`.
+
+    Permissive for non-Claude models (valid_efforts_for_model returns None →
+    no constraint). For Claude/Bedrock, strict against the live-verified matrix
+    so a doomed effort is rejected at command time instead of 400ing on the wire.
+    """
+    allowed = valid_efforts_for_model(model)
+    if allowed is None:
+        return True  # unconstrained provider
+    return str(effort or "").strip().lower() in allowed
+
+
+
 def _forbids_sampling_params(model: str) -> bool:
     """Return True for models that 400 on any non-default temperature/top_p/top_k.
 
