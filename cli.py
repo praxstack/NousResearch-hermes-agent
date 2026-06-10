@@ -3947,7 +3947,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _thinking_mode = None
         _model_lower = (model_name or "").lower()
         if any(s in _model_lower for s in ("opus-4-7", "opus-4-8", "opus-5",
-                                            "sonnet-4-6", "sonnet-4-7", "sonnet-5")):
+                                            "sonnet-4-6", "sonnet-4-7", "sonnet-5",
+                                            "fable")):
             _thinking_mode = "adaptive"
         # 1M context = encoded in :1m suffix (Hermes-internal sigil) OR
         # context_length >= 1M.
