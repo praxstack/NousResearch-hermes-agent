@@ -473,9 +473,27 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # prefers live discovery via ListFoundationModels + ListInferenceProfiles.
     # Use inference profile IDs (us.*) since most models require them.
     "bedrock": [
+        # Global inference profiles (broadest routing, typically lowest TTFT —
+        # verified 2026-06-10) listed first, then the us. regional profiles.
+        "global.anthropic.claude-fable-5",
+        "global.anthropic.claude-fable-5:1m",
+        "us.anthropic.claude-fable-5",
+        "us.anthropic.claude-fable-5:1m",
+        "global.anthropic.claude-opus-4-8",
+        "global.anthropic.claude-opus-4-8:1m",
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-8:1m",
+        "global.anthropic.claude-opus-4-7",
+        "global.anthropic.claude-opus-4-7:1m",
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-opus-4-7:1m",
+        "global.anthropic.claude-sonnet-4-6",
+        "global.anthropic.claude-sonnet-4-6:1m",
         "us.anthropic.claude-sonnet-4-6",
-        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-sonnet-4-6:1m",
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0",
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.anthropic.claude-opus-4-6-v1",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "us.amazon.nova-pro-v1:0",
         "us.amazon.nova-lite-v1:0",
