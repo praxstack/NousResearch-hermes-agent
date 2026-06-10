@@ -388,10 +388,14 @@ _MAXED_BEDROCK_BETAS = [
 ]
 
 def _is_claude_4_7_or_later(wire_model: str) -> bool:
-    """True if wire_model is Claude Opus 4.7+ (accepts adaptive thinking schema).
+    """True if wire_model uses the modern adaptive-thinking schema.
 
     Opus 4.6 and earlier reject `thinking.type=adaptive` — use enabled+budget
-    there. Conservative match: only triggers on the exact 4.7 ID we know works.
+    there. Conservative match: only triggers on IDs verified to accept the
+    adaptive schema. Includes the named Fable/Mythos-class models, which are
+    the same modern contract as Opus 4.7+ (live-verified 2026-06-10: Fable 5
+    requires thinking.type=adaptive + output_config.effort and rejects the
+    budget-token schema, exactly like Opus 4.8).
     """
     if not wire_model:
         return False
@@ -404,6 +408,8 @@ def _is_claude_4_7_or_later(wire_model: str) -> bool:
         or "claude-sonnet-5" in m
         or "claude-opus-4-8" in m
         or "claude-opus-4-9" in m
+        or "claude-fable" in m
+        or "claude-mythos" in m
     )
 
 # ---------------------------------------------------------------------------
@@ -477,6 +483,7 @@ def _bedrock_forbids_temp_and_top_p_together(wire_model: str) -> bool:
 # prefixes are handled at runtime via the prefix check in
 # ``split_bedrock_1m_suffix``.
 _CLAUDE_1M_CAPABLE_BASE_IDS = (
+    "anthropic.claude-fable-5",
     "anthropic.claude-opus-4-8",
     "anthropic.claude-opus-4-7",
     "anthropic.claude-opus-4-6-v1",

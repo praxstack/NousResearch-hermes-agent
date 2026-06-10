@@ -1880,3 +1880,88 @@ class TestCallConverseInvalidatesOnStaleError:
         )
 
         assert _bedrock_runtime_client_cache.get("us-east-1") is live_client
+
+
+class TestFable5Integration:
+    """Claude Fable 5 on Bedrock — PR-1 integration (2026-06-10).
+
+    Live-verified facts these tests lock in (probed against real Bedrock):
+      - Callable as us./global.anthropic.claude-fable-5 (CRI-prefixed).
+      - Adaptive thinking schema (thinking{type:adaptive}+output_config.effort);
+        budget-token schema is REJECTED -> Fable is in the 4.7+ family.
+      - hideSamplingParameter:true -> sampling params must be forbidden.
+      - 1M context via context-1m-2025-08-07 beta header -> fable-5:1m is real.
+    """
+
+    def test_fable5_is_modern_thinking_family(self):
+        """Fable 5 MUST be recognized as adaptive-thinking-schema family.
+
+        Regression guard: if this returns False, Fable silently routes through
+        the legacy enabled+budget path and 400s on Bedrock.
+        """
+        from agent.bedrock_adapter import _is_claude_4_7_or_later
+        assert _is_claude_4_7_or_later("anthropic.claude-fable-5") is True
+        assert _is_claude_4_7_or_later("us.anthropic.claude-fable-5") is True
+        assert _is_claude_4_7_or_later("global.anthropic.claude-fable-5") is True
+
+    def test_fable5_forbids_sampling_params(self):
+        """hideSamplingParameter:true -> temperature/top_p must be stripped."""
+        from agent.bedrock_adapter import _bedrock_forbids_sampling_params
+        assert _bedrock_forbids_sampling_params("us.anthropic.claude-fable-5") is True
+        assert _bedrock_forbids_sampling_params("global.anthropic.claude-fable-5") is True
+
+    def test_fable5_sampling_guard_matches_thinking_gate(self):
+        """The two family guards MUST agree on Fable (the codebase invariant)."""
+        from agent.bedrock_adapter import (
+            _bedrock_forbids_sampling_params,
+            _is_claude_4_7_or_later,
+        )
+        for model in [
+            "anthropic.claude-fable-5",
+            "us.anthropic.claude-fable-5",
+            "global.anthropic.claude-fable-5",
+        ]:
+            assert _bedrock_forbids_sampling_params(model) == _is_claude_4_7_or_later(model), (
+                f"Fable guard divergence on {model!r}"
+            )
+
+    def test_fable5_is_1m_capable(self):
+        """fable-5:1m must be a recognized 1M-capable model (beta header verified live)."""
+        from agent.bedrock_adapter import is_claude_1m_capable_model
+        assert is_claude_1m_capable_model("anthropic.claude-fable-5") is True
+        assert is_claude_1m_capable_model("us.anthropic.claude-fable-5") is True
+        assert is_claude_1m_capable_model("us.anthropic.claude-fable-5:1m") is True
+        assert is_claude_1m_capable_model("global.anthropic.claude-fable-5:1m") is True
+
+    def test_fable5_in_bedrock_picker_catalog(self):
+        """The Bedrock provider catalog must surface Fable 5 (base + :1m),
+        with BOTH global. and us. inference profiles (steer 2026-06-10)."""
+        from hermes_cli.models import _PROVIDER_MODELS
+        bedrock = _PROVIDER_MODELS["bedrock"]
+        assert "us.anthropic.claude-fable-5" in bedrock
+        assert "us.anthropic.claude-fable-5:1m" in bedrock
+        assert "global.anthropic.claude-fable-5" in bedrock
+        assert "global.anthropic.claude-fable-5:1m" in bedrock
+
+    def test_bedrock_catalog_has_global_profiles(self):
+        """Steer 2026-06-10: expose global. profiles wherever available, not just us.
+
+        Live-verified that global. routes 200 for fable/opus-4-8/4-7/sonnet-4-6/haiku.
+        """
+        from hermes_cli.models import _PROVIDER_MODELS
+        bedrock = _PROVIDER_MODELS["bedrock"]
+        for needed in [
+            "global.anthropic.claude-opus-4-8",
+            "global.anthropic.claude-opus-4-8:1m",
+            "global.anthropic.claude-sonnet-4-6",
+        ]:
+            assert needed in bedrock, f"{needed} missing from Bedrock picker"
+
+    def test_bedrock_catalog_includes_current_opus(self):
+        """Regression: the stale Bedrock catalog was missing Opus 4.8/4.7.
+
+        While we're here, ensure the picker isn't stuck on 4.6-era models.
+        """
+        from hermes_cli.models import _PROVIDER_MODELS
+        bedrock = _PROVIDER_MODELS["bedrock"]
+        assert any("claude-opus-4-8" in m for m in bedrock), "Opus 4.8 missing from Bedrock picker"
