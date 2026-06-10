@@ -1833,6 +1833,68 @@ def reset_discovery_cache():
     _discovery_cache.clear()
 
 
+# ---------------------------------------------------------------------------
+# /model picker ordering — family-rank tier (council-locked 2026-06-11)
+# ---------------------------------------------------------------------------
+# The /model picker (cli.py) and `hermes model` setup wizard list Bedrock
+# models in discover_bedrock_models() order. Before this, the sort key was
+# ``(global-first, name.lower())`` — purely alphabetical within the
+# global/regional split. That put ``global.amazon.nova-2-lite-v1:0`` at index
+# 0 (because "Amazon Nova…" alphabetizes above "Claude…"), so a careless
+# ``/model``+Enter+Enter silently switched the session to a tiny non-reasoning
+# model. We prepend a family-rank tier so the strongest reasoning families
+# surface first, keeping ``(global-first, name)`` as lower-priority tiebreakers
+# (preserves the within-family global-first capacity contract).
+#
+# Tiers (llm-council-plus, 2/2 unanimous):
+#   0  Claude Opus            (reasoning flagship / typical locked default)
+#   1  Claude (Fable, Sonnet, Haiku, other Claude)
+#   2  other reasoning families + UNKNOWN/new families (visible mid-list,
+#      never silently buried — fail-closed bias per council Q2)
+#   3  small / utility / non-text-primary (Nova, Titan, embed, rerank,
+#      stability, twelvelabs, …)
+
+# Tier-3 substrings: small/utility/non-text-primary model families. Matched
+# against the lowercased model id. Kept as an explicit table so adding a new
+# utility family is a one-line change and unclassified IDs fall through to the
+# reasoning tier (2), not the utility tier (3).
+_BEDROCK_UTILITY_FAMILY_MARKERS: tuple[str, ...] = (
+    "nova",
+    "titan",
+    "embed",
+    "rerank",
+    "stability",
+    "stable-",
+    "twelvelabs",
+    "pegasus",
+    "marengo",
+    "palmyra-vision",
+    "voxtral",
+)
+
+
+def _bedrock_family_rank(model_id: str) -> int:
+    """Return the picker ordering tier for a Bedrock model id (lower = higher).
+
+    Pure, total, never raises. See the module comment above for the tier
+    policy. Unknown/new families intentionally rank in tier 2 (mid-list,
+    visible) rather than tier 3 (buried) — a new strong model that costs a
+    scroll beats a tiny model that silently becomes the Enter-default.
+    """
+    mid = str(model_id or "").strip().lower()
+    if "anthropic.claude" in mid or mid.startswith("claude") or "claude-" in mid:
+        # Claude family — Opus is tier 0, the rest tier 1.
+        if "claude-opus" in mid or "opus-4" in mid or "opus-5" in mid:
+            return 0
+        return 1
+    # Small / utility / non-text-primary families sink to the bottom.
+    if any(marker in mid for marker in _BEDROCK_UTILITY_FAMILY_MARKERS):
+        return 3
+    # Everything else — reasoning-capable families AND unrecognised new
+    # families — ranks in the middle tier (council Q2: fail closed, visible).
+    return 2
+
+
 def discover_bedrock_models(
     region: str,
     provider_filter: Optional[List[str]] = None,
@@ -1957,8 +2019,12 @@ def discover_bedrock_models(
     except Exception as e:
         logger.debug("Skipping inference profile discovery: %s", e)
 
-    # Sort: global cross-region profiles first (recommended), then alphabetical
+    # Sort: family-rank tier first (Claude Opus > Claude > other reasoning >
+    # utility), then global cross-region profiles (recommended capacity), then
+    # alphabetical. The latter two terms preserve the prior within-family
+    # ordering contract (test_global_profiles_sorted_first).
     models.sort(key=lambda m: (
+        _bedrock_family_rank(m["id"]),
         0 if m["id"].startswith("global.") else 1,
         m["name"].lower(),
     ))
