@@ -6899,7 +6899,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             state["stage"] = "model"
             state["provider_data"] = provider_data
             state["model_list"] = model_list
-            state["selected"] = 0
+            # Default the highlight to the model the user is already running so
+            # Enter (no arrow) is a no-op, not a switch to index 0. Falls back
+            # to 0 when the current model isn't in this provider's list (e.g.
+            # switching provider, or current model region-pulled) — safe
+            # because the Bedrock list is ordered Claude-first.
+            from hermes_cli.model_switch import resolve_current_model_index
+            state["selected"] = resolve_current_model_index(
+                model_list, state.get("current_model")
+            )
             self._invalidate(min_interval=0.0)
             return
         if stage == "model":
