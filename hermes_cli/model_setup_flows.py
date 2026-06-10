@@ -25,6 +25,33 @@ import os
 import subprocess
 
 
+def bedrock_reasoning_effort_choices(model: str) -> list:
+    """Graded reasoning-effort levels offerable for a Bedrock Claude model.
+
+    PR-2 Atom B (2026-06-10). Wraps agent.anthropic_adapter.valid_efforts_for_model
+    (the single source of truth shared with the /reasoning command) and adapts it
+    for _prompt_reasoning_effort_selection, which renders a separate "Disable
+    reasoning" choice for 'none'. So we return only the GRADED levels (none
+    stripped), preserving weakest→strongest order:
+
+      Opus 4.7+/4.8, Fable/Mythos -> [low, medium, high, xhigh, max]
+      Sonnet/Opus 4.6            -> [low, medium, high, max]   (no xhigh)
+      Haiku 4.5 / legacy Claude  -> []   (no adaptive thinking; picker is skipped)
+      non-Claude                 -> []   (handled by other providers; not offered here)
+
+    Never includes 'minimal' (Bedrock 400s it on the adaptive path).
+    """
+    try:
+        from agent.anthropic_adapter import valid_efforts_for_model
+    except Exception:
+        return []
+    allowed = valid_efforts_for_model(model)
+    if not allowed:
+        return []
+    # Drop 'none' — the effort picker exposes it as a dedicated Disable option.
+    return [lvl for lvl in allowed if lvl != "none"]
+
+
 def _prompt_auth_credentials_choice(title: str) -> str:
     """Prompt for reuse / reauthenticate / cancel with the standard radio UI.
 
@@ -2362,6 +2389,7 @@ def _model_flow_bedrock(config, current_model=""):
     from hermes_cli.config import (
         get_env_value,
         load_config,
+        save_config,
         save_env_value,
     )
 
@@ -2550,6 +2578,38 @@ def _model_flow_bedrock(config, current_model=""):
         use_prompt_caching=use_prompt_caching,
         vpc_endpoint_url=vpc_endpoint_url,
     )
+
+    # Composite step (PR-2 Atom B): after the model is chosen, offer the
+    # reasoning-effort levels THIS family actually accepts on Bedrock (family-
+    # aware — no xhigh for Sonnet, none-only for Haiku, never 'minimal'). Driven
+    # by the same source of truth as the /reasoning command so the picker and the
+    # wire stay in lock-step. Haiku/legacy/non-adaptive families return [] here
+    # and the reasoning prompt is skipped entirely.
+    try:
+        from hermes_cli.main import (
+            _current_reasoning_effort,
+            _prompt_reasoning_effort_selection,
+            _set_reasoning_effort,
+        )
+        _effort_choices = bedrock_reasoning_effort_choices(selected)
+        if _effort_choices:
+            _cfg = load_config()
+            _selected_effort = _prompt_reasoning_effort_selection(
+                _effort_choices,
+                current_effort=_current_reasoning_effort(_cfg),
+            )
+            if _selected_effort is not None:
+                _set_reasoning_effort(_cfg, _selected_effort)
+                save_config(_cfg)
+                if _selected_effort == "none":
+                    print("  Reasoning disabled for this model.")
+                else:
+                    print(f"  Reasoning effort set to: {_selected_effort}")
+    except (KeyboardInterrupt, EOFError):
+        print()  # user bailed on the reasoning prompt — model choice already saved
+    except Exception:
+        pass  # never block model selection on the optional reasoning step
+
     print(f"  Default model set to: {selected} (via AWS Bedrock, {region})")
 
 
