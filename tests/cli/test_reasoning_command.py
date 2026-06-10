@@ -768,3 +768,71 @@ class TestReasoningShownThisTurnFlag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Family-aware /reasoning validation (PR-2 Atom A, 2026-06-10)
+# ---------------------------------------------------------------------------
+
+class TestReasoningFamilyAwareValidation(unittest.TestCase):
+    """The /reasoning handler must reject an effort the ACTIVE model would 400 on.
+
+    Exercises the REAL _handle_reasoning_command bound onto a stub, with
+    cli._cprint and cli.save_config_value patched, asserting that:
+      - xhigh on Sonnet 4.6 is rejected (not applied)
+      - any thinking effort on Haiku 4.5 is rejected
+      - 'minimal' is rejected on the Bedrock adaptive path
+      - valid effort on Opus 4.8 / Fable 5 is accepted (config set)
+      - non-Claude models are unconstrained (no regression)
+    """
+
+    def _make_cli(self, model):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        cli = CLICommandsMixin.__new__(CLICommandsMixin)
+        cli.model = model
+        cli.provider = "bedrock"
+        cli.reasoning_config = None
+        cli.show_reasoning = False
+        cli.agent = MagicMock()
+        return cli
+
+    def _run(self, model, arg):
+        """Run /reasoning <arg> against the real handler; return (applied, output)."""
+        cli = self._make_cli(model)
+        captured = []
+        with patch("cli._cprint", side_effect=lambda *a, **k: captured.append(a[0] if a else "")), \
+             patch("cli.save_config_value", return_value=False):
+            cli._handle_reasoning_command(f"/reasoning {arg}")
+        applied = cli.reasoning_config is not None
+        return applied, "\n".join(str(c) for c in captured)
+
+    def test_xhigh_rejected_on_sonnet(self):
+        applied, out = self._run("global.anthropic.claude-sonnet-4-6", "xhigh")
+        self.assertFalse(applied, "xhigh must NOT be applied on Sonnet 4.6")
+        self.assertIn("not supported", out.lower())
+
+    def test_high_rejected_on_haiku(self):
+        applied, out = self._run("us.anthropic.claude-haiku-4-5-20251001-v1:0", "high")
+        self.assertFalse(applied, "thinking must NOT be applied on Haiku 4.5")
+        self.assertIn("none", out.lower())
+
+    def test_minimal_rejected_on_opus(self):
+        applied, out = self._run("us.anthropic.claude-opus-4-8", "minimal")
+        self.assertFalse(applied, "'minimal' must be rejected on the adaptive path")
+
+    def test_xhigh_accepted_on_opus(self):
+        applied, _ = self._run("us.anthropic.claude-opus-4-8", "xhigh")
+        self.assertTrue(applied, "xhigh must be accepted on Opus 4.8")
+
+    def test_high_accepted_on_fable(self):
+        applied, _ = self._run("us.anthropic.claude-fable-5", "high")
+        self.assertTrue(applied, "high must be accepted on Fable 5")
+
+    def test_none_accepted_on_haiku(self):
+        applied, _ = self._run("us.anthropic.claude-haiku-4-5-20251001-v1:0", "none")
+        self.assertTrue(applied, "none must be accepted on Haiku 4.5")
+
+    def test_non_claude_unconstrained(self):
+        # gpt model: valid_efforts_for_model returns None -> no family gate
+        applied, _ = self._run("gpt-5.5", "xhigh")
+        self.assertTrue(applied, "non-Claude models must not be constrained by the family gate")
