@@ -111,3 +111,30 @@ def test_bedrock_model_picker_dedupes_all_inference_profile_prefixes(monkeypatch
     assert "au.anthropic.claude-sonnet-4-6" in seen_models
     assert "anthropic.claude-haiku-4-5" not in seen_models
     assert "anthropic.claude-sonnet-4-6" not in seen_models
+
+
+def test_bedrock_reasoning_choices_family_aware():
+    """PR-2 Atom B: the Bedrock model flow offers family-aware reasoning levels.
+
+    bedrock_reasoning_effort_choices(model) returns the GRADED levels (no 'none'
+    — the picker has a separate Disable option) valid for that family, so the
+    composite model->reasoning picker never offers an effort the model 400s on.
+    """
+    from hermes_cli.model_setup_flows import bedrock_reasoning_effort_choices
+
+    # Opus 4.8 / Fable: low..xhigh..max (no none in the graded list, no minimal)
+    opus = bedrock_reasoning_effort_choices("us.anthropic.claude-opus-4-8")
+    assert "xhigh" in opus and "max" in opus
+    assert "none" not in opus and "minimal" not in opus
+
+    fable = bedrock_reasoning_effort_choices("us.anthropic.claude-fable-5")
+    assert "xhigh" in fable and "max" in fable
+
+    # Sonnet 4.6: no xhigh
+    sonnet = bedrock_reasoning_effort_choices("global.anthropic.claude-sonnet-4-6")
+    assert "xhigh" not in sonnet
+    assert "high" in sonnet and "max" in sonnet
+
+    # Haiku 4.5: no graded levels at all (none-only family) -> empty list
+    haiku = bedrock_reasoning_effort_choices("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+    assert haiku == [], "Haiku has no adaptive thinking — no graded effort choices"
