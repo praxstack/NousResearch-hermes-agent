@@ -56,7 +56,10 @@ def test_bedrock_api_key_flow_saves_native_bedrock_provider(monkeypatch):
         ],
     )
 
-    main_mod._model_flow_bedrock_api_key({}, "us-east-1")
+    # Upstream extracted the _model_flow_* functions out of hermes_cli.main
+    # into hermes_cli.model_setup_flows; call the canonical location.
+    import hermes_cli.model_setup_flows as flows_mod
+    flows_mod._model_flow_bedrock_api_key({}, "us-east-1")
 
     assert saved_cfg["model"]["provider"] == "bedrock"
     assert (
@@ -98,7 +101,10 @@ def test_bedrock_model_picker_dedupes_all_inference_profile_prefixes(monkeypatch
 
     monkeypatch.setattr(auth_mod, "_prompt_model_selection", fake_prompt)
 
-    selected = main_mod._discover_bedrock_model_list("us-east-1")
+    # Upstream extracted _discover_bedrock_model_list out of hermes_cli.main
+    # into hermes_cli.model_setup_flows; call the canonical location.
+    import hermes_cli.model_setup_flows as flows_mod
+    selected = flows_mod._discover_bedrock_model_list("us-east-1")
 
     assert selected == "apac.anthropic.claude-haiku-4-5"
     assert "apac.anthropic.claude-haiku-4-5" in seen_models
