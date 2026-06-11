@@ -134,7 +134,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "aiohttp==3.13.4",  # CVE-2026-34513/34518/34519/34520/34525
     ),
     "platform.matrix": (
-        "mautrix[encryption]==0.21.0",  # PRAX-PATCH: Markdown spec intentionally dropped (false-positive); upstream now agrees
+        "mautrix[encryption]==0.21.0",
         "aiosqlite==0.22.1",
         "asyncpg==0.31.0",
         "aiohttp-socks==0.11.0",
