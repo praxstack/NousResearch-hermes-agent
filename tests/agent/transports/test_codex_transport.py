@@ -272,6 +272,29 @@ class TestCodexBuildKwargs:
         # "minimal" should be clamped to "low"
         assert kw.get("reasoning", {}).get("effort") == "low"
 
+    def test_max_effort_clamped_to_xhigh(self, transport):
+        # The fleet-wide agent.reasoning_effort="max" is valid for Bedrock
+        # Fable/Opus/Sonnet (sent as adaptive `thinking` via the bedrock/anthropic
+        # transport — never this code), but the codex/Responses wire (gpt-5.5)
+        # rejects "max": HTTP 400 "Supported values are: ... 'xhigh'." This hop is
+        # the final fallback in the Bedrock chain, so an un-clamped "max" aborts it.
+        # Regression guard for that fix: max must clamp to xhigh (the codex ceiling).
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=messages, tools=[],
+            reasoning_config={"effort": "max"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "xhigh"
+
+    def test_xhigh_effort_passes_through(self, transport):
+        # xhigh is the legitimate codex ceiling — must NOT be altered.
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=messages, tools=[],
+            reasoning_config={"effort": "xhigh"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "xhigh"
+
     def test_xai_reasoning_effort_passed(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

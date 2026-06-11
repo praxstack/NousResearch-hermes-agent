@@ -162,7 +162,18 @@ class ResponsesApiTransport(ProviderTransport):
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
-        _effort_clamp = {"minimal": "low"}
+        # The codex/Responses wire (openai-codex GPT-5.5, xai grok) accepts only
+        # none|minimal|low|medium|high|xhigh — NOT "max". The fleet-wide
+        # agent.reasoning_effort="max" is correct for Bedrock Fable/Opus/Sonnet
+        # (those go through the bedrock/anthropic transport as adaptive `thinking`,
+        # never reaching this code), but when the fallback chain drops to the
+        # gpt-5.5 codex hop, an un-clamped "max" 400s:
+        #   "Invalid value: 'max'. Supported values are: ... 'xhigh'."
+        # Clamp max→xhigh (the codex ceiling) HERE, at the only point effort
+        # enters the codex_responses payload — same pattern as minimal→low.
+        # Provider-isolated by construction: this transport is gated to
+        # openai-codex/xai-oauth, so Bedrock max-effort is untouched.
+        _effort_clamp = {"minimal": "low", "max": "xhigh"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
