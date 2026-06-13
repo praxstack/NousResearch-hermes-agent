@@ -192,10 +192,17 @@ class TestParseReasoningEffort:
 
     @pytest.mark.parametrize(
         "value",
-        ["bogus", "very-high", "max", "0", "off", "true", "default"],
+        ["bogus", "very-high", "0", "off", "true", "default"],
     )
     def test_unknown_levels_return_none(self, value):
-        """Unrecognized strings fall back to the caller default (None)."""
+        """Unrecognized strings fall back to the caller default (None).
+
+        Note: "max" was REMOVED from this list 2026-06-13 — the carried
+        commit 8bc12c8d76 added "max" to VALID_REASONING_EFFORTS (config
+        reaches the adapter as adaptive+effort:max), so it is now a VALID
+        level, not an unknown one. Upstream's cdc0a47dd58 added this test
+        before that feature existed; this aligns the test with the feature.
+        """
         assert parse_reasoning_effort(value) is None
 
     def test_known_supported_levels_are_documented(self):
