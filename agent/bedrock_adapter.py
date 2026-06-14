@@ -504,6 +504,12 @@ _BEDROCK_NO_TEMP_AND_TOP_P_SUBSTRINGS = (
     "claude-opus-4.6",
     "claude-sonnet-4-6",
     "claude-sonnet-4.6",
+    # Haiku 4.5 also 400s on temperature+top_p together (live-verified 2026-06-14:
+    # "temperature and top_p cannot both be specified for this model"). It is NOT in
+    # upstream's _forbids_sampling_params exclusion logic, so without this entry both
+    # params reach the wire and 400. Keep temperature, drop top_p.
+    "claude-haiku-4-5",
+    "claude-haiku-4.5",
 )
 
 
