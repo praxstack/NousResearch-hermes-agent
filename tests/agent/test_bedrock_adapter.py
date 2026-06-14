@@ -735,10 +735,28 @@ class TestBuildConverseKwargs:
     def test_keeps_sampling_params_for_bedrock_non_restricted_models(self):
         from agent.bedrock_adapter import build_converse_kwargs
 
+        # test-model is non-Claude → no guards → BOTH params pass through.
+        kwargs = build_converse_kwargs(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=0.7,
+            top_p=0.9,
+        )
+        assert kwargs["inferenceConfig"].get("temperature") == 0.7
+        assert kwargs["inferenceConfig"].get("topP") == 0.9
+
+    def test_drops_top_p_for_models_that_reject_temp_and_top_p_together(self):
+        """Sonnet 4.6 / Haiku 4.5 on Bedrock 400 when BOTH temperature and top_p
+        are set ("temperature and top_p cannot both be specified for this model").
+        Live-verified 2026-06-14. We keep temperature and drop top_p. (Upstream's
+        _forbids_sampling_params excludes the 4.6/haiku family, so without this
+        guard both params reach the wire and 400 in production.)
+        """
+        from agent.bedrock_adapter import build_converse_kwargs
+
         for model_id in (
             "anthropic.claude-sonnet-4-6-20250514-v1:0",
             "anthropic.claude-haiku-4-5",
-            "test-model",
         ):
             kwargs = build_converse_kwargs(
                 model=model_id,
@@ -746,9 +764,23 @@ class TestBuildConverseKwargs:
                 temperature=0.7,
                 top_p=0.9,
             )
+            ic = kwargs["inferenceConfig"]
+            assert ic.get("temperature") == 0.7, model_id
+            assert "topP" not in ic, model_id  # dropped — both-together 400s on Bedrock
 
-            assert kwargs["inferenceConfig"].get("temperature") == 0.7
-            assert kwargs["inferenceConfig"].get("topP") == 0.9
+        # Either param ALONE is accepted (no guard fires).
+        only_temp = build_converse_kwargs(
+            model="anthropic.claude-sonnet-4-6-20250514-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=0.7,
+        )
+        assert only_temp["inferenceConfig"].get("temperature") == 0.7
+        only_top_p = build_converse_kwargs(
+            model="anthropic.claude-sonnet-4-6-20250514-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            top_p=0.9,
+        )
+        assert only_top_p["inferenceConfig"].get("topP") == 0.9
 
     def test_bedrock_opus_strips_sampling_params_but_keeps_stop_sequences(self):
         from agent.bedrock_adapter import build_converse_kwargs
