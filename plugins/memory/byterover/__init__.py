@@ -62,6 +62,47 @@ _MIN_OUTPUT_LEN = 20
 # explicit historical-intent signal. Matches lowercase YAML scalar values.
 _FILTERED_STATUSES = frozenset({"resolved", "superseded", "candidate_resolved"})
 
+# Schema v1.3 (2026-06-15) — NOISE-CATEGORY auto-recall suppression.
+# The status filter (v1.1) only drops resolved/superseded entries. But the tree is
+# dominated by ACTIVE cron-curation noise from OTHER profiles (Dr Alex rubric evaluators,
+# agent-evolution daemon-status logs, per-session parity-rebase state snapshots). These are
+# `status: active` so v1.1 lets them through, and they keyword-match almost any technical
+# message -> injected every turn as irrelevant <memory-context>. v1.3 drops entries whose
+# SLUG matches a noise pattern from AUTO-recall (prefetch) only. They remain fully reachable
+# via the explicit brv_query tool and via historical-intent queries. Kill switch:
+# BRV_NOISE_FILTER=0. Patterns are substrings matched against the lowercased slug.
+_NOISE_SLUG_PATTERNS = (
+    "rubric_evaluator",          # dr_alex_coder_profile_rubric_evaluator_*
+    "rubric_evaluation",         # *_rubric_evaluation_result / _may_20_2026
+    "rubric_may", "rubric_jun",  # dated rubric snapshots
+    "_profile_rubric",
+    "quality_rubric",            # dsa_prep_socratic_quality_rubric_*
+    "quality_score",             # dsa_prep_socratic_quality_score_*
+    "quality_evaluator", "quality_evaluation",
+    "socratic_quality",          # dr_alex_dsa_prep_socratic_quality_*
+    "evaluator_prompt",          # *_rubric_evaluator_prompt
+    "evaluation_result",
+    "daemon_status",             # dralexmorganbot_daemon_status
+    "session_state",             # active_model_*_session_state_NN
+    "session_recap",
+    "_canary_verdict",
+    "agent_evolution_loop",      # evolve-cron dumps
+    "evolve_run", "evolve_cycle", "evolve_session",
+    "_shadow_run", "gepa_shadow",
+)
+
+
+def _noise_filter_enabled() -> bool:
+    """Return False iff BRV_NOISE_FILTER explicitly disables the v1.3 noise filter."""
+    val = os.environ.get("BRV_NOISE_FILTER", "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def _is_noise_slug(slug: str) -> bool:
+    """True if a slug is cron-curation noise that should not AUTO-recall."""
+    s = (slug or "").lower()
+    return any(pat in s for pat in _NOISE_SLUG_PATTERNS)
+
 # Substrings (case-insensitive) that bypass the filter when present in
 # the user's query. Conservative wordlist — false-positive bypass costs
 # stale recall, false-negative bypass costs hidden history. Tuned toward
@@ -437,14 +478,26 @@ def _apply_schema_filter(
     entries = _apply_recency_decay(entries)
     kept, hidden = _filter_resolved_entries(entries, historical_intent=historical)
 
+    # Schema v1.3 — drop noise-category slugs from AUTO-recall (unless historical-intent
+    # or kill-switched). These stay reachable via the explicit brv_query tool.
+    noise_hidden: List[Tuple[str, str]] = []
+    if _noise_filter_enabled() and not historical:
+        filtered_kept: List[Tuple[str, str]] = []
+        for slug, body in kept:
+            if slug != "__preamble__" and _is_noise_slug(slug):
+                noise_hidden.append((slug, body))
+            else:
+                filtered_kept.append((slug, body))
+        kept = filtered_kept
+
     _log_filter_decision(
         brv_cwd=brv_cwd,
         query=query,
-        hidden_entries=hidden,
+        hidden_entries=hidden + noise_hidden,
         bypassed=historical,
     )
 
-    return _reassemble_output(kept, hidden_count=len(hidden))
+    return _reassemble_output(kept, hidden_count=len(hidden) + len(noise_hidden))
 
 
 # ---------------------------------------------------------------------------
