@@ -23,7 +23,7 @@ import pytest
 
 
 def test_validator_accepts_https_url():
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     ok, err = main_mod._validate_bedrock_vpc_endpoint_url(
         "https://vpce-1234.bedrock-runtime.us-east-1.vpce.amazonaws.com"
@@ -33,7 +33,7 @@ def test_validator_accepts_https_url():
 
 
 def test_validator_strips_whitespace_but_still_validates():
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     ok, _ = main_mod._validate_bedrock_vpc_endpoint_url(
         "  https://example.com  "
@@ -42,7 +42,7 @@ def test_validator_strips_whitespace_but_still_validates():
 
 
 def test_validator_rejects_empty():
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     ok, err = main_mod._validate_bedrock_vpc_endpoint_url("")
     assert ok is False
@@ -50,7 +50,7 @@ def test_validator_rejects_empty():
 
 
 def test_validator_rejects_missing_scheme():
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     ok, err = main_mod._validate_bedrock_vpc_endpoint_url(
         "vpce-1234.bedrock-runtime.us-east-1.vpce.amazonaws.com"
@@ -60,7 +60,7 @@ def test_validator_rejects_missing_scheme():
 
 
 def test_validator_rejects_unknown_scheme():
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     ok, err = main_mod._validate_bedrock_vpc_endpoint_url("ftp://example.com")
     assert ok is False
@@ -68,7 +68,7 @@ def test_validator_rejects_unknown_scheme():
 
 
 def test_validator_rejects_missing_host():
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     ok, err = main_mod._validate_bedrock_vpc_endpoint_url("https://")
     assert ok is False
@@ -91,14 +91,14 @@ def _scripted_input(answers):
 
 
 def test_prompt_skip_returns_current(monkeypatch):
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     monkeypatch.setattr(builtins, "input", _scripted_input([""]))
     assert main_mod._prompt_bedrock_vpc_endpoint_url("") == ""
 
 
 def test_prompt_skip_keeps_existing_value(monkeypatch):
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     monkeypatch.setattr(builtins, "input", _scripted_input([""]))
     assert (
@@ -108,7 +108,7 @@ def test_prompt_skip_keeps_existing_value(monkeypatch):
 
 
 def test_prompt_returns_valid_url(monkeypatch):
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     monkeypatch.setattr(
         builtins,
@@ -122,7 +122,7 @@ def test_prompt_returns_valid_url(monkeypatch):
 
 
 def test_prompt_reprompts_on_invalid_url(monkeypatch, capsys):
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     # First answer is invalid (no scheme), second is valid.
     monkeypatch.setattr(
@@ -139,7 +139,7 @@ def test_prompt_reprompts_on_invalid_url(monkeypatch, capsys):
 
 
 def test_prompt_propagates_keyboard_interrupt(monkeypatch):
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     def _raise(_prompt=""):
         raise KeyboardInterrupt
@@ -201,7 +201,7 @@ def _stub_save_pipeline(monkeypatch, *, initial_cfg):
 
 def test_api_key_flow_skips_vpc_endpoint_url_by_default(monkeypatch):
     """Pressing Enter on the VPC prompt must NOT write a vpc_endpoint_url key."""
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     saved_cfg, _ = _stub_save_pipeline(
         monkeypatch, initial_cfg={"model": {"default": "existing-model"}}
@@ -221,7 +221,7 @@ def test_api_key_flow_skips_vpc_endpoint_url_by_default(monkeypatch):
 
 def test_api_key_flow_persists_vpc_endpoint_url_when_provided(monkeypatch):
     """A valid URL must end up under bedrock.vpc_endpoint_url verbatim."""
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     saved_cfg, _ = _stub_save_pipeline(
         monkeypatch, initial_cfg={"model": {"default": "existing-model"}}
@@ -255,7 +255,7 @@ def test_api_key_flow_clears_vpc_endpoint_url_when_user_blanks_out(monkeypatch):
     pins it down: re-running setup with the existing config and pressing
     Enter on every prompt round-trips the same vpc_endpoint_url.
     """
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
 
     initial_cfg = {
         "model": {"default": "existing-model"},
@@ -281,7 +281,7 @@ def test_api_key_flow_clears_vpc_endpoint_url_when_user_blanks_out(monkeypatch):
 
 def test_save_helper_pops_vpc_endpoint_url_when_blank(monkeypatch):
     """Direct unit test of _save_bedrock_model_selection: blank arg => popped."""
-    import hermes_cli.main as main_mod
+    import hermes_cli.model_setup_flows as main_mod
     import hermes_cli.auth as auth_mod
     import hermes_cli.config as config_mod
 
