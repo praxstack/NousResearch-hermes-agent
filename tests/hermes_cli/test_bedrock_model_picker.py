@@ -280,15 +280,33 @@ class TestBedrockRegionRouting:
     """End-to-end: region from botocore profile is used for discovery, so EU/AP
     users get eu.*/ap.* model IDs rather than the hardcoded us-east-1 list."""
 
-    def test_eu_region_from_botocore_profile_yields_eu_models(self):
+    def test_eu_region_from_botocore_profile_yields_eu_models(self, monkeypatch):
         """When botocore resolves eu-central-1, picker shows eu.* model IDs."""
         from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.models import provider_model_ids
+
+        # Clear AWS_REGION / AWS_DEFAULT_REGION so resolve_bedrock_region()
+        # falls through to the botocore profile (priority 3). On a machine with
+        # real Bedrock creds these are set (e.g. us-east-1) and would otherwise
+        # win over the mocked botocore profile, yielding us.* — making the test
+        # machine-state-dependent.
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
 
         mock_session = MagicMock()
         mock_session.get_config_variable.return_value = "eu-central-1"
 
+        # Bypass the on-disk provider-models cache so the mocked live discovery
+        # path is actually exercised. Without this, cached_provider_model_ids()
+        # returns whatever real discovery wrote to disk on this machine
+        # (us.*/global.*), bypassing the mock and making the test
+        # machine-state-dependent (passes on a clean CI box, fails locally).
+        def _live(provider, **_kw):
+            return provider_model_ids(provider, force_refresh=True)
+
         with patch("agent.bedrock_adapter.has_aws_credentials", return_value=True), \
              patch("agent.bedrock_adapter.discover_bedrock_models", side_effect=_mock_discover), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=_live), \
              _mock_botocore_session(return_value=mock_session):
             providers = list_authenticated_providers(current_provider="bedrock")
 
@@ -301,11 +319,17 @@ class TestBedrockRegionRouting:
     def test_us_region_from_env_var_yields_us_models(self, monkeypatch):
         """Explicit AWS_REGION=us-east-1 returns us.* model IDs."""
         from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.models import provider_model_ids
 
         monkeypatch.setenv("AWS_REGION", "us-east-1")
 
+        # Bypass the on-disk provider-models cache (see eu-region test above).
+        def _live(provider, **_kw):
+            return provider_model_ids(provider, force_refresh=True)
+
         with patch("agent.bedrock_adapter.has_aws_credentials", return_value=True), \
-             patch("agent.bedrock_adapter.discover_bedrock_models", side_effect=_mock_discover):
+             patch("agent.bedrock_adapter.discover_bedrock_models", side_effect=_mock_discover), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=_live):
             providers = list_authenticated_providers(current_provider="bedrock")
 
         bedrock = next((p for p in providers if p["slug"] == "bedrock"), None)
