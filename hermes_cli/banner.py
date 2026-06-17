@@ -640,6 +640,100 @@ def _display_toolset_name(toolset_name: str) -> str:
     )
 
 
+def _maybe_render_dralex_banner(console: "Console", model: str, session_id: str = None) -> bool:
+    """Prax custom: render a calm CLINICAL banner for the `dralex` profile and
+    return True (caller early-returns), suppressing the generic Hermes
+    tools/skills/commits-behind noise that is anti-therapeutic in a Dr. Alex
+    session. Shows LIVE therapy-stack status (turns, last-talked, DB, daemon +
+    shim health, memory layers). For any other profile, returns False so the
+    normal banner renders unchanged. Never raises — any failure falls through
+    to the normal banner.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        if get_active_profile_name() != "dralex":
+            return False
+    except Exception:
+        return False
+
+    # Pull live therapy-stack status (stdlib-only reader, <100ms, crash-proof).
+    status = {}
+    try:
+        import sys as _sys
+        _ts_src = "/Users/praxlannister/Documents/workspace/therapy-stack/src"
+        if _ts_src not in _sys.path:
+            _sys.path.insert(0, _ts_src)
+        from therapy_stack.banner_status import gather_status
+        status = gather_status()
+    except Exception:
+        status = {}
+
+    from rich.panel import Panel
+
+    teal = _skin_color("banner_title", "#7fd1c4")
+    sage = _skin_color("banner_accent", "#9db9a8")
+    ink = _skin_color("banner_text", "#c9d6d3")
+    dim = _skin_color("banner_dim", "#5a6b6e")
+    ok_c = _skin_color("ui_ok", "#8fcf9f")
+    warn_c = _skin_color("ui_warn", "#e0c08a")
+
+    def _svc(up: bool) -> str:
+        return f"[{ok_c}]● up[/]" if up else f"[{warn_c}]○ down[/]"
+
+    turns = status.get("turns")
+    last = status.get("last_talked")
+    db_ok = status.get("db_ok")
+    layers = status.get("layers", {})
+    svcs = status.get("services", {})
+    convos = status.get("vault_convos")
+
+    layer_str = " · ".join(
+        f"[{ink}]{name.upper()}[/]" if layers.get(name) else f"[{dim}]{name}[/]"
+        for name in ("history", "facts", "profile", "graph")
+    )
+
+    lines = []
+    lines.append(f"[bold {teal}]Dr. Alex Morgan[/]  [{dim}]· private clinical session[/]")
+    lines.append("")
+    if turns is not None:
+        talk = f"  ·  last talked [{ink}]{last}[/]" if last else ""
+        lines.append(f"  [{sage}]conversation[/]   [{ink}]{turns} turns[/] kept{talk}")
+    else:
+        lines.append(f"  [{sage}]conversation[/]   [{warn_c}]no history yet[/]")
+    lines.append(f"  [{sage}]memory[/]         {layer_str}   "
+                 + (f"[{ok_c}]DB ok[/]" if db_ok else f"[{warn_c}]DB unreadable[/]"))
+    if convos is not None:
+        lines.append(f"  [{sage}]vault log[/]      [{ink}]{convos}[/] dated conversations mirrored")
+    lines.append(f"  [{sage}]model[/]          [{ink}]opus-4.8 (1m · max)[/] · C-SSRS · WAI-SR · constitution")
+    lines.append(f"  [{sage}]services[/]       daemon (telegram) {_svc(svcs.get('daemon', False))}"
+                 f"   ·   shim (tui/desktop/browser) {_svc(svcs.get('shim', False))}")
+    lines.append("")
+    lines.append(f"  [{dim}]same brain across Telegram · TUI · desktop · browser[/]")
+    lines.append(f"  [{dim}]nothing here is urgent. take your time.[/]")
+
+    body = "\n".join(lines)
+    panel = Panel(
+        body,
+        border_style=dim,
+        title=f"[{teal}]a private space[/]",
+        title_align="left",
+        padding=(1, 3),
+    )
+    # Optional skin logo above the panel (the DR ALEX wordmark).
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        _logo = get_active_skin().banner_logo
+        if _logo:
+            console.print()
+            console.print(_logo)
+    except Exception:
+        pass
+    console.print()
+    console.print(panel)
+    console.print()
+    return True
+
+
 def build_welcome_banner(console: "Console", model: str, cwd: str,
                          tools: List[dict] = None,
                          enabled_toolsets: List[str] = None,
@@ -662,6 +756,12 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             preset name and the banner renders the aggregator instead of a
             bare model slug.
     """
+    # Prax custom: the `dralex` profile gets a calm clinical banner with live
+    # therapy-stack status instead of the generic Hermes tools/skills/commits-
+    # behind grid. Early-return when it rendered; fall through otherwise.
+    if _maybe_render_dralex_banner(console, model, session_id):
+        return
+
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
     from rich.panel import Panel
     from rich.table import Table
