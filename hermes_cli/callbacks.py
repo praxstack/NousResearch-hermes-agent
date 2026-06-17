@@ -15,6 +15,52 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 from hermes_constants import display_hermes_home
 
 
+def _notify_attention(title: str, message: str) -> None:
+    """Fire a best-effort attention signal when an interactive prompt is
+    waiting on the user. Critical for terminals (cmux, headless tmux panes)
+    that do NOT surface prompt_toolkit prompts visually — without this the
+    user can miss an approval and it times out to deny.
+
+    Two channels, both non-blocking and failure-tolerant:
+      1. macOS notification via ``osascript`` (backgrounded, 5s cap).
+      2. Terminal BEL (\\a) — cmux/Ghostty/iTerm raise an attention badge.
+
+    Gated by ``approvals.notify`` (default True). Never raises.
+    """
+    try:
+        from cli import CLI_CONFIG
+        if not CLI_CONFIG.get("approvals", {}).get("notify", True):
+            return
+    except Exception:
+        pass
+    # 1. Terminal bell — cheapest, surfaces in cmux/Ghostty even when unfocused.
+    try:
+        import sys
+        sys.stderr.write("\a")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    # 2. macOS notification (backgrounded so it never blocks the prompt loop).
+    try:
+        import sys as _sys
+        if _sys.platform != "darwin":
+            return
+        import subprocess
+        safe_title = title.replace('"', "'")[:120]
+        safe_msg = message.replace('"', "'")[:240]
+        script = (
+            f'display notification "{safe_msg}" with title "{safe_title}" '
+            f'sound name "Glass"'
+        )
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+
 def clarify_callback(cli, question, choices):
     """Prompt for clarifying question through the TUI.
 
@@ -216,8 +262,24 @@ def approval_callback(cli, command: str, description: str) -> str:
         }
         cli._approval_deadline = _time.monotonic() + timeout
 
+        # Attention signal (bell + macOS notification) so the prompt isn't
+        # missed in terminals that don't surface it visually (cmux/tmux).
+        # Without this, an unseen prompt times out to "deny" after `timeout`s.
+        _notify_attention(
+            "Hermes — approval needed",
+            (description or command or "A command needs your approval")[:200],
+        )
+
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
+
+        # Re-notify with backoff: if the first attention signal was missed,
+        # fire follow-ups as the deadline approaches. Fractions of the total
+        # timeout window remaining at which to re-alert (escalating urgency).
+        _renotify_at = sorted(
+            {timeout * 0.5, timeout * 0.2, 12.0}, reverse=True
+        )
+        _renotified = set()
 
         while True:
             try:
@@ -231,6 +293,16 @@ def approval_callback(cli, command: str, description: str) -> str:
                 remaining = cli._approval_deadline - _time.monotonic()
                 if remaining <= 0:
                     break
+                # Escalating re-notification for missed prompts.
+                for mark in _renotify_at:
+                    if remaining <= mark and mark not in _renotified:
+                        _renotified.add(mark)
+                        _notify_attention(
+                            "Hermes — approval still waiting",
+                            f"{int(remaining)}s left before auto-deny: "
+                            + (description or command or "command")[:160],
+                        )
+                        break
                 if hasattr(cli, "_app") and cli._app:
                     cli._app.invalidate()
 
@@ -239,4 +311,8 @@ def approval_callback(cli, command: str, description: str) -> str:
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
         cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+        _notify_attention(
+            "Hermes — command auto-denied",
+            "Approval timed out with no response; command was denied.",
+        )
         return "deny"
