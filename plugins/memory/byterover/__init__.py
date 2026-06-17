@@ -288,19 +288,37 @@ def _parse_entry_updated_at(entry_body: str) -> Optional[_dt.datetime]:
 def _split_entries(query_output: str) -> List[Tuple[str, str]]:
     """Split brv query output into [(slug, body)] tuples.
 
-    Header lines `### <slug>` separate entries. The first chunk before the
-    first header (typically `**Summary**: Found N relevant topics...`) is
-    returned with slug `__preamble__` so callers can preserve it.
+    Header lines `### <slug>` separate entries, BUT only when the header is a
+    REAL entry header — byterover emits every entry as `### <slug>\\n---\\n<yaml
+    frontmatter>\\n---\\n<body>`. Section SUB-headers inside an entry body
+    (`### Structure`, `### Dependencies`, `### Highlights`, `### Rules`,
+    `### Examples`, `### Narrative` — from the `.overview.md` companions) ALSO
+    match `### <word>` but are followed by PROSE, not a `---` frontmatter block.
+    Treating them as entry boundaries fragments a single entry into pieces (a
+    pre-existing splitter bug, latent until the v1.4 relevance gate began
+    scoring per-fragment). The discriminator is exact and verified across the
+    tree: a real entry header is immediately followed by a `---` line; a
+    sub-header is not.
 
-    Returns an empty list if no headers found — caller should treat the
+    The first chunk before the first REAL header (typically
+    `**Summary**: Found N relevant topics...`) is returned with slug
+    `__preamble__` so callers can preserve it.
+
+    Returns an empty list if no real headers found — caller should treat the
     whole output as a single un-splittable blob.
     """
-    headers = list(_ENTRY_HEADER_RE.finditer(query_output))
+    all_headers = list(_ENTRY_HEADER_RE.finditer(query_output))
+    # Keep only headers immediately followed by a YAML frontmatter block.
+    headers = []
+    for m in all_headers:
+        after = query_output[m.end():].lstrip("\n")
+        if after.startswith("---"):
+            headers.append(m)
     if not headers:
         return []
 
     entries: List[Tuple[str, str]] = []
-    # Preamble (everything before first ### header)
+    # Preamble (everything before first real ### header)
     preamble = query_output[: headers[0].start()].rstrip()
     if preamble:
         entries.append(("__preamble__", preamble))
@@ -456,6 +474,196 @@ def _log_filter_decision(
         logger.debug("ByteRover filter-log write failed: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Schema v1.4 (2026-06-17) — QUERY-RELEVANCE GATE.
+#
+# Root cause this fixes: `brv query` is QUERY-INDEPENDENT. Empirically, an
+# off-topic query ("how to cook pasta carbonara") returns the same high-salience
+# cron-log rows (parity-rebase session state, daemon status) as any technical
+# query. The v1.1 status filter and v1.3 noise denylist are partial — new
+# cron-noise slug shapes (grading_result, council_round2, *_config_state,
+# skill_library_update_session) keep outrunning the denylist.
+#
+# Two layers, both SYNCHRONOUS and INSTANT (no network on the hot prefetch path):
+#   (a) STRUCTURAL pre-filter — a regex catching the cron-noise CLASS (dated
+#       snapshots + profile-eval/result/state/status slug shapes), so we don't
+#       chase individual slug strings forever. Defense-in-depth over v1.3.
+#   (b) LEXICAL relevance gate — token overlap between the query and each
+#       entry's (slug + body), stopworded. Drops entries with near-zero overlap.
+#       This is the query-dependence the brv ranker lacks. Catches the
+#       pasta-carbonara→parity-logs case with ZERO latency.
+#
+# OPTIONAL (off by default, BRV_EMBED_RERANK=1): a local-ollama embedding
+# re-rank of the lexical survivors (nomic-embed-text, content-hash cached).
+# Kept off by default because the prefetch path is synchronous and blocks the
+# first LLM call — a per-turn network/subprocess embed hop (~0.1-1.5s) is a
+# latency regression most turns don't need. The lexical gate already solves the
+# total-irrelevance bug; embeddings only add synonym/paraphrase recall, which is
+# an opt-in upgrade, not a default tax.
+#
+# Empty-floor: if NOTHING clears the gate, return preamble-only (effectively
+# empty recall). Council 2/2 unanimous: empty beats top-1 (top-1 on an
+# off-topic query is GUARANTEED to be the highest-salience cron row — i.e. it
+# reproduces the exact bug). Kill switch: BRV_RELEVANCE_GATE=0.
+# ---------------------------------------------------------------------------
+
+# Structural noise: profile-eval/state slug shapes. We do NOT treat a bare
+# date-stamp (_may_2026, _2026_05_28) as noise — many LEGITIMATE notes carry
+# dates (ADRs, verified-inventory snapshots). Only the genuine cron-curation
+# CLASS qualifies: rubric/eval/grading/score *results* and *evaluators*,
+# session/config/daemon STATE+STATUS+RECAP rows, parity-rebase logs, council
+# rounds, and skill-library session dumps. Verified against real entries
+# 2026-06-17 (praxvault_gbrain_..._adr_may_2026 must NOT match).
+_STRUCTURAL_NOISE_RE = re.compile(
+    r"(?:"
+    r"(?:rubric|grading|eval|evaluation|quality|score|scoring)_(?:result|evaluator|score|eval|evaluation)"
+    r"|profile_rubric"                                             # *_profile_rubric_evaluation
+    r"|rubric_(?:evaluation|evaluator|result)"
+    r"|_(?:config_state|session_state|session_status|daemon_status|daemon_session_status|session_recap|canary_verdict)"
+    r"|click_probability_grading"
+    r"|parity_branch_rebase"
+    r"|skill_library_(?:update|session)"
+    r"|council_round\d"
+    r")",
+    re.IGNORECASE,
+)
+
+# Stopwords for the lexical gate — common English + brv/markdown structural tokens.
+_GATE_STOPWORDS = frozenset("""
+a an the and or but is are was were be been being to of in on at for with from by as it its
+this that these those i you he she we they my your our their what which who how why when where
+do does did done can could should would will shall may might must have has had not no yes if then
+than into out up down over under about above below back more most some any all each every
+result results structure dependencies highlights rules examples narrative reason summary task
+changes flow timestamp author md status active jun may session state config
+""".split())
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _relevance_gate_enabled() -> bool:
+    val = os.environ.get("BRV_RELEVANCE_GATE", "1").strip().lower()
+    return val not in {"0", "false", "no", "off"}
+
+
+def _embed_rerank_enabled() -> bool:
+    val = os.environ.get("BRV_EMBED_RERANK", "0").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _tokenize(text: str) -> set:
+    """Lowercase alnum tokens, stopworded, length>=3 (drops 'a', 'to', ids like 't1')."""
+    if not text:
+        return set()
+    toks = _TOKEN_RE.findall(text.lower())
+    return {t for t in toks if len(t) >= 3 and t not in _GATE_STOPWORDS}
+
+
+def _lexical_relevance(query_tokens: set, slug: str, body: str) -> float:
+    """Overlap score in [0,1]: fraction of QUERY tokens present in the entry.
+
+    Slug tokens count double-weight (a slug match is a strong signal). We score
+    against the query's token set (not the entry's) so a long noisy entry can't
+    dilute a real match, and a terse entry can't be unfairly penalized.
+    """
+    if not query_tokens:
+        return 1.0  # no usable query signal -> don't gate (defensive: keep brv order)
+    slug_tokens = _tokenize(slug.replace("/", " ").replace("-", " ").replace("_", " "))
+    # Body: only the first ~600 chars (summary/highlights carry the signal; full
+    # body is mostly boilerplate sections that we stopword out anyway).
+    body_tokens = _tokenize(body[:600])
+    entry_tokens = slug_tokens | body_tokens
+    if not entry_tokens:
+        return 0.0
+    matched = query_tokens & entry_tokens
+    slug_matched = query_tokens & slug_tokens
+    # base = fraction of query tokens found anywhere; bonus for slug hits.
+    base = len(matched) / len(query_tokens)
+    slug_bonus = 0.25 * (len(slug_matched) / len(query_tokens))
+    return min(1.0, base + slug_bonus)
+
+
+# Lexical floor: an entry must share at least this fraction of query tokens.
+# Tuned on the empirical probes: "pasta carbonara" vs cron rows scores 0.0;
+# a real on-topic query scores >> 0.15. Conservative (low) to avoid dropping
+# genuine-but-terse matches; the structural filter + status/noise filters do
+# the heavy lifting, this gate just kills TOTAL irrelevance.
+_LEXICAL_FLOOR = 0.15
+
+
+def _apply_relevance_gate(
+    kept: List[Tuple[str, str]],
+    query: str,
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """Partition kept entries into (relevant, irrelevant) by the lexical gate.
+
+    Preamble is always retained in `relevant`. Structural-noise slugs are
+    dropped first (cheap), then the lexical floor is applied. Returns the
+    survivors and the dropped set (for audit + empty-floor accounting).
+    """
+    query_tokens = _tokenize(query)
+    relevant: List[Tuple[str, str]] = []
+    dropped: List[Tuple[str, str]] = []
+    for slug, body in kept:
+        if slug == "__preamble__":
+            relevant.append((slug, body))
+            continue
+        # (a) structural class filter
+        if _STRUCTURAL_NOISE_RE.search(slug):
+            dropped.append((slug, body))
+            continue
+        # (b) lexical floor
+        score = _lexical_relevance(query_tokens, slug, body)
+        if score < _LEXICAL_FLOOR:
+            dropped.append((slug, body))
+        else:
+            relevant.append((slug, body))
+    return relevant, dropped
+
+
+def _embed_rerank(relevant: List[Tuple[str, str]], query: str) -> List[Tuple[str, str]]:
+    """OPTIONAL local-ollama embedding re-rank of lexical survivors.
+
+    Off by default (BRV_EMBED_RERANK). Uses ollama nomic-embed-text (local, no
+    network egress). Best-effort: on ANY failure (ollama down, timeout) returns
+    the input order unchanged — never breaks prefetch. Preamble stays at index 0.
+    """
+    non_preamble = [(s, b) for s, b in relevant if s != "__preamble__"]
+    preamble = [(s, b) for s, b in relevant if s == "__preamble__"]
+    if len(non_preamble) < 2:
+        return relevant
+    try:
+        import urllib.request
+
+        def embed(text: str) -> Optional[List[float]]:
+            payload = json.dumps({"model": "nomic-embed-text", "prompt": text[:2000]}).encode()
+            req = urllib.request.Request(
+                "http://localhost:11434/api/embeddings", data=payload,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return json.loads(r.read()).get("embedding")
+
+        qv = embed(query)
+        if not qv:
+            return relevant
+
+        def cos(a: List[float], b: List[float]) -> float:
+            dot = sum(x * y for x, y in zip(a, b))
+            na = math.sqrt(sum(x * x for x in a)) or 1.0
+            nb = math.sqrt(sum(y * y for y in b)) or 1.0
+            return dot / (na * nb)
+
+        scored = []
+        for slug, body in non_preamble:
+            ev = embed(f"{slug} {body[:600]}")
+            scored.append((cos(qv, ev) if ev else 0.0, slug, body))
+        scored.sort(key=lambda t: -t[0])
+        return preamble + [(s, b) for _, s, b in scored]
+    except Exception as e:
+        logger.debug("ByteRover embed-rerank skipped: %s", e)
+        return relevant
+
+
 def _apply_schema_filter(
     raw_output: str,
     query: str,
@@ -495,14 +703,35 @@ def _apply_schema_filter(
                 filtered_kept.append((slug, body))
         kept = filtered_kept
 
+    # Schema v1.4 — QUERY-RELEVANCE GATE (structural class filter + lexical floor).
+    # This is the fix for the query-independent brv ranker: an off-topic query
+    # must not surface high-salience cron rows. Empty-floor: if nothing clears
+    # the gate, recall collapses to preamble-only (empty beats top-1). Bypassed
+    # on historical-intent (the user explicitly wants history) or kill switch.
+    gate_hidden: List[Tuple[str, str]] = []
+    if _relevance_gate_enabled() and not historical:
+        relevant, gate_hidden = _apply_relevance_gate(kept, query)
+        # OPTIONAL: local-ollama embedding re-rank of survivors (default OFF).
+        if _embed_rerank_enabled() and len(relevant) > 2:
+            relevant = _embed_rerank(relevant, query)
+        kept = relevant
+
     _log_filter_decision(
         brv_cwd=brv_cwd,
         query=query,
-        hidden_entries=hidden + noise_hidden,
+        hidden_entries=hidden + noise_hidden + gate_hidden,
         bypassed=historical,
     )
 
-    return _reassemble_output(kept, hidden_count=len(hidden) + len(noise_hidden))
+    # Empty-floor: if only the preamble survived (everything was irrelevant),
+    # return empty so no <memory-context> block is injected. An empty recall is
+    # strictly better than an irrelevant one — irrelevant context poisons the LLM.
+    non_preamble = [e for e in kept if e[0] != "__preamble__"]
+    if not non_preamble:
+        return ""
+
+    total_hidden = len(hidden) + len(noise_hidden) + len(gate_hidden)
+    return _reassemble_output(kept, hidden_count=total_hidden)
 
 
 # ---------------------------------------------------------------------------
