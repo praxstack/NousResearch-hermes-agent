@@ -36,6 +36,21 @@ from plugins.memory.byterover import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolate_from_v14_gate(monkeypatch):
+    """Disable the v1.4 query-relevance gate for THIS file.
+
+    This file targets the v1.1 (resolved/superseded) and recency layers, which
+    are orthogonal to the v1.4 relevance gate. The synthetic fixtures here use
+    slugs/bodies that deliberately don't lexically match their neutral test
+    queries (e.g. slug 'old_one' vs query 'some query'), so the v1.4 gate would
+    correctly empty them and mask the layer under test. The gate has its own
+    dedicated coverage in test_byterover_relevance_gate.py. Standard
+    layer-isolation, not behavior-masking.
+    """
+    monkeypatch.setenv("BRV_RELEVANCE_GATE", "0")
+
+
 def _entry(slug: str, status: str | None, updated_at: str = "2026-05-25T10:00:00.000Z",
            summary: str = "test entry") -> str:
     """Build a synthetic per-entry block matching brv query output shape."""
