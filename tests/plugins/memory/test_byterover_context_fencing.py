@@ -58,6 +58,20 @@ from plugins.memory.byterover import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _force_fencing_on(monkeypatch):
+    """Force BRV_CONTEXT_FENCING=1 for this file, isolating from the operator env.
+
+    Layer-4 fencing has an operator kill switch (BRV_CONTEXT_FENCING) which is
+    legitimately set to "0" in Prax's shell env. With it off, _apply_context_fence
+    correctly no-ops and every fencing assertion here fails — an env artifact, not
+    a code bug. This autouse fixture pins fencing ON so the suite is robust to the
+    operator's environment. Tests in TestFeatureFlag set their own value via their
+    own monkeypatch, which overrides this within the test body.
+    """
+    monkeypatch.setenv("BRV_CONTEXT_FENCING", "1")
+
+
 def _make_provider(tmp_path: Path) -> ByteRoverMemoryProvider:
     """Provider with cwd set to tmp_path so audit logs are isolated."""
     p = ByteRoverMemoryProvider()
