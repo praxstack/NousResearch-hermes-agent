@@ -12,6 +12,7 @@ import pytest
 
 from agent.tool_dispatch_helpers import (
     _extract_file_mutation_targets,
+    _extract_parallel_scope_path,
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
     make_tool_result_message,
@@ -294,3 +295,25 @@ class TestFileMutationTargets:
             },
         )
         assert targets == ["old/name.py", "new/name.py"]
+
+
+class TestExtractParallelScopePath:
+    """Regression (2026-06-20): _extract_parallel_scope_path must not crash on
+    an unresolvable ~user path. Path.expanduser() raises RuntimeError 'Could
+    not determine home directory' for ~someuser-that-doesn't-exist; that was
+    uncaught and could crash the tool-dispatch path. It must return None
+    (caller then falls back to safe sequential execution)."""
+
+    def test_unresolvable_tilde_user_returns_none(self):
+        result = _extract_parallel_scope_path(
+            "read_file", {"path": "~nonexistentuser12345/x.py"}
+        )
+        assert result is None
+
+    def test_normal_path_still_resolves(self):
+        result = _extract_parallel_scope_path("read_file", {"path": "/tmp/foo.py"})
+        assert result is not None
+        assert str(result).endswith("foo.py")
+
+    def test_missing_path_arg_returns_none(self):
+        assert _extract_parallel_scope_path("read_file", {}) is None
