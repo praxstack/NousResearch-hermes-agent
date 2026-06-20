@@ -325,3 +325,27 @@ class TestOutsideWorkspaceRejection:
         outside.mkdir(exist_ok=True)
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         assert tracker._is_valid_subdir(outside) is False
+
+    def test_unresolvable_tilde_user_does_not_crash(self, project):
+        """Regression (2026-06-20): a tool-call path/command containing an
+        unresolvable ~user token (e.g. ~someuser that doesn't exist, or ~ with
+        HOME unset) made Path.expanduser() raise RuntimeError 'Could not
+        determine home directory', which was NOT caught by the
+        (OSError, ValueError) except clause and crashed the entire agent
+        tool-execution loop (observed in the SysDesign evolve cron, API call
+        #13). check_tool_call must swallow it and return None, never raise.
+        """
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        # Direct helper: must not raise.
+        candidates = set()
+        tracker._add_path_candidate("~nonexistentuser12345/foo/bar.py", candidates)
+        # Via a terminal command (the real crash path).
+        result = tracker.check_tool_call(
+            "terminal", {"command": "cat ~nonexistentuser12345/x.txt"}
+        )
+        assert result is None  # no hints, but crucially: no exception
+        # Via a path-scoped tool arg.
+        result2 = tracker.check_tool_call(
+            "read_file", {"path": "~nonexistentuser12345/y.py"}
+        )
+        assert result2 is None
