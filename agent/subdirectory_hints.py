@@ -144,7 +144,14 @@ class SubdirectoryHintTracker:
                 if parent == p:
                     break  # filesystem root
                 p = parent
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
+            # Best-effort hint extraction must NEVER crash the tool-execution
+            # loop. Path.expanduser() raises RuntimeError "Could not determine
+            # home directory" for an unresolvable ~user token (e.g. a terminal
+            # command referencing ~someuser that doesn't exist, or ~ with HOME
+            # unset) — that was uncaught here and crashed entire agent turns
+            # (observed 2026-06-20 in the SysDesign evolve cron, API call #13).
+            # Any failure to resolve a candidate path is non-fatal: skip it.
             pass
 
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):
