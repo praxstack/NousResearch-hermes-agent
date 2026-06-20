@@ -156,7 +156,15 @@ def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Optiona
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
 
-    expanded = Path(raw_path).expanduser()
+    try:
+        expanded = Path(raw_path).expanduser()
+    except (OSError, ValueError, RuntimeError):
+        # Path.expanduser() raises RuntimeError "Could not determine home
+        # directory" for an unresolvable ~user token. Returning None makes the
+        # caller fall back to SEQUENTIAL execution (the safe default) instead of
+        # crashing the tool-dispatch path. (Same class as the 2026-06-20
+        # subdirectory_hints crash.)
+        return None
     if expanded.is_absolute():
         return Path(os.path.abspath(str(expanded)))
 
