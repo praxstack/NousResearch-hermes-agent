@@ -5763,6 +5763,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Eager import-chain self-check (added 2026-06-26 after the
+        # rebase-under-live-fleet incident).  The tool-dispatch path
+        # (run_agent -> agent.tool_executor -> `from agent.display import
+        # redact_tool_args_for_display`) is imported LAZILY on the first tool
+        # call, not at boot.  If the hot ~/.hermes/hermes-agent tree was
+        # rewritten under a running daemon (e.g. a git rebase/pull while the
+        # gateway was live), the cached agent.display can lack a symbol the
+        # updated tool_executor expects, so the daemon boots "healthy" (banner,
+        # 190 tools) yet 500s on EVERY tool call with `cannot import name ...`.
+        # Forcing the chain here makes a torn/stale tree fail boot LOUDLY so
+        # launchd KeepAlive retries until the tree is consistent, instead of
+        # serving a silent zombie.  Best-effort: only the known dispatch chain.
+        try:
+            import agent.tool_executor as _te  # noqa: F401
+            from agent.display import redact_tool_args_for_display as _rtad  # noqa: F401
+        except ImportError as _imp_err:
+            logger.critical(
+                "Gateway boot self-check FAILED: the tool-dispatch import chain "
+                "is inconsistent (%s). This usually means ~/.hermes/hermes-agent "
+                "was rewritten (git rebase/pull/update) while a gateway was live. "
+                "Refusing to boot a zombie that would 500 on every tool call; "
+                "exiting so KeepAlive restarts on the now-consistent tree.",
+                _imp_err,
+            )
+            raise
         try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
