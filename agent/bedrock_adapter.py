@@ -1635,6 +1635,87 @@ def stream_converse_with_callbacks(
 
 
 # ---------------------------------------------------------------------------
+# Per-model output-token ceilings for the Bedrock Converse API.
+# ---------------------------------------------------------------------------
+# Background (RCA 2026-06-27): the agent's Bedrock build path previously
+# hardcoded ``max_tokens=4096`` whenever the user did not set an explicit
+# ``model.max_tokens`` in config — starving every Bedrock response at 4096
+# output tokens regardless of the model's true ceiling. A single large
+# write_file / artifact build would hit ``stopReason=max_tokens`` and trigger
+# the truncated-tool-call retry loop. This resolver replaces that lazy default
+# with the model's *native* output ceiling.
+#
+# IMPORTANT — clamp behaviour differs by model family:
+#   * Claude (opus/sonnet/haiku) and OpenAI gpt-oss CLAMP gracefully: an
+#     over-high maxTokens is silently reduced to the model limit (verified
+#     live 2026-06-27: opus-4-8 + sonnet-4-6 + gpt-oss-120b all accept
+#     maxTokens=128000 → stopReason=end_turn).
+#   * Amazon Nova REJECTS an over-high maxTokens with a ValidationException
+#     ("exceeds the model limit of 10000"). So a blanket 128000 is WRONG —
+#     the ceiling MUST be resolved per-model.
+#
+# Substring match against the normalized (lowercased, region-prefixed) wire
+# model id. Longest-match wins so specific families beat the generic default.
+_BEDROCK_NON_CLAUDE_OUTPUT_LIMITS = {
+    # Amazon Nova family — hard 10k output cap (rejects above).
+    "amazon.nova-pro":    10_000,
+    "amazon.nova-lite":    10_000,
+    "amazon.nova-micro":   10_000,
+    "amazon.nova-premier": 10_000,
+    "nova-pro":            10_000,
+    "nova-lite":           10_000,
+    "nova-micro":          10_000,
+    "nova-premier":        10_000,
+    # OpenAI open-weight models on Bedrock — clamp gracefully, generous cap.
+    "gpt-oss":            128_000,
+    # Meta Llama on Bedrock — conservative documented ceiling.
+    "llama":                8_192,
+    # Mistral on Bedrock.
+    "mistral":              8_192,
+    # DeepSeek on Bedrock.
+    "deepseek":             8_192,
+}
+
+# Conservative default for an unrecognized non-Claude Bedrock model: high
+# enough to never starve a normal response, low enough to be accepted by the
+# overwhelming majority of SKUs (avoids the Nova-style hard rejection at the
+# very top end). Claude models never reach this branch.
+_BEDROCK_DEFAULT_OUTPUT_LIMIT = 8_192
+
+
+def resolve_bedrock_max_output(model: str) -> int:
+    """Return the native max-output-token ceiling for a Bedrock model.
+
+    Claude models (the entire current Hermes fleet + fallback chain) resolve
+    via ``_get_anthropic_max_output`` — e.g. opus-4-8 → 128_000, sonnet-4-6 →
+    64_000. Non-Claude SKUs resolve via the Bedrock family table above, with a
+    conservative 8_192 fallback for anything unrecognized.
+
+    The ``:1m`` context-window suffix and region prefixes
+    (us./eu./jp./au./global.) are handled transparently by substring matching.
+    """
+    from agent.anthropic_adapter import _get_anthropic_max_output, _is_claude_model
+
+    # Claude resolves through the shared Anthropic table (handles :1m, region
+    # prefixes, date stamps, and per-version ceilings). Claude families clamp
+    # an over-high maxTokens gracefully, so the table value is always safe.
+    if _is_claude_model(model):
+        return _get_anthropic_max_output(model)
+
+    m = (model or "").lower().replace(".", "-")
+    # Re-introduce a dotted form too, since some keys use dots (amazon.nova-*).
+    m_dotted = (model or "").lower()
+    best_key = ""
+    best_val = _BEDROCK_DEFAULT_OUTPUT_LIMIT
+    for key, val in _BEDROCK_NON_CLAUDE_OUTPUT_LIMITS.items():
+        k_norm = key.replace(".", "-")
+        if (k_norm in m or key in m_dotted) and len(key) > len(best_key):
+            best_key = key
+            best_val = val
+    return best_val
+
+
+# ---------------------------------------------------------------------------
 # High-level API: call Bedrock Converse
 # ---------------------------------------------------------------------------
 
@@ -1642,7 +1723,7 @@ def build_converse_kwargs(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 64000,
+    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -1656,12 +1737,21 @@ def build_converse_kwargs(
     from the wire ``modelId`` and the ``context-1m-2025-08-07`` Anthropic
     beta is attached via ``additionalModelRequestFields`` — matching Cline's
     Bedrock 1M-context-window opt-in.
+
+    When ``max_tokens`` is None or 0 the model's NATIVE output ceiling is used
+    (RCA 2026-06-27: this previously defaulted to a flat 64000, which both
+    starved opus-4-8 at half its 128k ceiling and would over-shoot Nova's 10k
+    hard limit). See ``resolve_bedrock_max_output``.
     """
     system_prompt, converse_messages = convert_messages_to_converse(messages)
 
     # 1M-context opt-in: strip ``:1m`` from the wire modelId and remember
     # we need to attach the beta header.
     wire_model, enable_1m_context = split_bedrock_1m_suffix(model)
+
+    # Resolve the output ceiling per-model when the caller didn't pin one.
+    if not max_tokens:
+        max_tokens = resolve_bedrock_max_output(model)
 
     kwargs: Dict[str, Any] = {
         "modelId": wire_model,
@@ -1738,7 +1828,7 @@ def call_converse(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 64000,
+    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -1779,7 +1869,7 @@ def call_converse_stream(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 64000,
+    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
