@@ -620,11 +620,30 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"
         guardrail = getattr(agent, "_bedrock_guardrail_config", None)
+        # Resolve the OUTPUT token cap (RCA 2026-06-27 — was hardcoded `or 4096`,
+        # which starved every Bedrock response at 4096 output tokens and drove
+        # the truncated-tool-call retry loop). Precedence:
+        #   1. _ephemeral_max_output_tokens — the "output cap too large for this
+        #      prompt" retry sets this so the next call fits the window. It was
+        #      previously IGNORED on the Bedrock path (the safety net was dead);
+        #      honor it first now so the retry actually shrinks the cap.
+        #   2. agent.max_tokens — explicit config override (model.max_tokens).
+        #   3. the model's NATIVE ceiling (opus-4-8 → 128k, sonnet-4-6 → 64k,
+        #      Nova → 10k, …) via resolve_bedrock_max_output — never a flat 4096.
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+        if _ephemeral_out is not None:
+            agent._ephemeral_max_output_tokens = None  # consume immediately
+            _bedrock_max_tokens = _ephemeral_out
+        elif agent.max_tokens:
+            _bedrock_max_tokens = agent.max_tokens
+        else:
+            _bedrock_max_tokens = resolve_bedrock_max_output(agent.model)
         return _bt.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
-            max_tokens=agent.max_tokens or 4096,
+            max_tokens=_bedrock_max_tokens,
             region=region,
             guardrail_config=guardrail,
         )
