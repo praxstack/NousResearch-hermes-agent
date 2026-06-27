@@ -2238,3 +2238,121 @@ class TestFable5Integration:
         from hermes_cli.models import _PROVIDER_MODELS
         bedrock = _PROVIDER_MODELS["bedrock"]
         assert any("claude-opus-4-8" in m for m in bedrock), "Opus 4.8 missing from Bedrock picker"
+
+
+# ---------------------------------------------------------------------------
+# Per-model output-token ceiling resolution (RCA 2026-06-27)
+# ---------------------------------------------------------------------------
+# Regression guard for the bug where the Bedrock build path hardcoded
+# max_tokens=4096 (and adapter defaults 64000), starving Opus 4.8 at a
+# fraction of its 128k native ceiling and driving the truncated-tool-call
+# retry loop on any large write_file / artifact build.
+
+class TestResolveBedrockMaxOutput:
+    """resolve_bedrock_max_output() returns each model's NATIVE output ceiling."""
+
+    def test_opus_4_8_resolves_to_128k(self):
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        assert resolve_bedrock_max_output("global.anthropic.claude-opus-4-8:1m") == 128_000
+
+    def test_opus_4_8_all_region_prefixes_resolve_to_128k(self):
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        for region in ("global", "us", "eu", "jp", "au"):
+            mid = f"{region}.anthropic.claude-opus-4-8:1m"
+            assert resolve_bedrock_max_output(mid) == 128_000, mid
+
+    def test_opus_4_7_resolves_to_128k(self):
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        assert resolve_bedrock_max_output("us.anthropic.claude-opus-4-7:1m") == 128_000
+
+    def test_sonnet_4_6_resolves_to_64k(self):
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        assert resolve_bedrock_max_output("global.anthropic.claude-sonnet-4-6:1m") == 64_000
+
+    def test_haiku_4_5_resolves_to_64k(self):
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        assert resolve_bedrock_max_output("anthropic.claude-haiku-4-5") == 64_000
+
+    def test_gpt_oss_resolves_to_128k(self):
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        assert resolve_bedrock_max_output("openai.gpt-oss-120b-1:0") == 128_000
+
+    def test_nova_family_capped_at_10k(self):
+        """Nova REJECTS an over-high maxTokens (verified live) — must cap at 10k."""
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        for mid in ("us.amazon.nova-pro-v1:0", "us.amazon.nova-lite-v1:0",
+                    "amazon.nova-micro-v1:0", "us.amazon.nova-premier-v1:0"):
+            assert resolve_bedrock_max_output(mid) == 10_000, mid
+
+    def test_unknown_model_gets_conservative_default(self):
+        """Unknown non-Claude SKU → 8192 (safe; never starves a normal reply,
+        never over-shoots a low hard limit like Nova's)."""
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        assert resolve_bedrock_max_output("some.brand-new-model-v9:0") == 8_192
+
+    def test_never_returns_the_old_starvation_default(self):
+        """The 4096 starvation cap must never come back for a real fleet model."""
+        from agent.bedrock_adapter import resolve_bedrock_max_output
+        assert resolve_bedrock_max_output("global.anthropic.claude-opus-4-8:1m") != 4096
+
+
+class TestBuildConverseKwargsMaxTokens:
+    """build_converse_kwargs resolves maxTokens per-model when none is pinned."""
+
+    def test_omitted_max_tokens_uses_native_ceiling_opus(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+        k = build_converse_kwargs(
+            model="global.anthropic.claude-opus-4-8:1m",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert k["inferenceConfig"]["maxTokens"] == 128_000
+
+    def test_omitted_max_tokens_caps_nova_at_10k(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+        k = build_converse_kwargs(
+            model="us.amazon.nova-pro-v1:0",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert k["inferenceConfig"]["maxTokens"] == 10_000
+
+    def test_explicit_max_tokens_wins(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+        k = build_converse_kwargs(
+            model="global.anthropic.claude-opus-4-8:1m",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=2048,
+        )
+        assert k["inferenceConfig"]["maxTokens"] == 2048
+
+    def test_zero_max_tokens_falls_back_to_native_ceiling(self):
+        """A falsy 0 must NOT pin a zero cap — resolve the native ceiling."""
+        from agent.bedrock_adapter import build_converse_kwargs
+        k = build_converse_kwargs(
+            model="global.anthropic.claude-opus-4-8:1m",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=0,
+        )
+        assert k["inferenceConfig"]["maxTokens"] == 128_000
+
+
+class TestBedrockTransportBuildKwargsMaxTokens:
+    """BedrockTransport.build_kwargs resolves the ceiling when caller omits it."""
+
+    def test_transport_resolves_native_ceiling_when_omitted(self):
+        from agent.transports.bedrock import BedrockTransport
+        bt = BedrockTransport()
+        kwargs = bt.build_kwargs(
+            model="global.anthropic.claude-opus-4-8:1m",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert kwargs["inferenceConfig"]["maxTokens"] == 128_000
+
+    def test_transport_explicit_max_tokens_wins(self):
+        from agent.transports.bedrock import BedrockTransport
+        bt = BedrockTransport()
+        kwargs = bt.build_kwargs(
+            model="global.anthropic.claude-opus-4-8:1m",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=5000,
+        )
+        assert kwargs["inferenceConfig"]["maxTokens"] == 5000
