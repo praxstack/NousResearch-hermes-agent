@@ -41,21 +41,28 @@ class BedrockTransport(ProviderTransport):
         Calls convert_messages and convert_tools internally.
 
         params:
-            max_tokens: int — output token limit (default 4096)
+            max_tokens: int — output token limit. When omitted/None, resolves
+                to the model's native ceiling via resolve_bedrock_max_output
+                (RCA 2026-06-27: previously defaulted to a flat 4096 here,
+                which starved Bedrock responses if a caller skipped the param).
             temperature: float | None
             guardrail_config: dict | None — Bedrock guardrails
             region: str — AWS region (default 'us-east-1')
         """
-        from agent.bedrock_adapter import build_converse_kwargs
+        from agent.bedrock_adapter import build_converse_kwargs, resolve_bedrock_max_output
 
         region = params.get("region", "us-east-1")
         guardrail = params.get("guardrail_config")
+
+        _max_tokens = params.get("max_tokens")
+        if not _max_tokens:  # None or 0 → resolve the model's native ceiling
+            _max_tokens = resolve_bedrock_max_output(model)
 
         kwargs = build_converse_kwargs(
             model=model,
             messages=messages,
             tools=tools,
-            max_tokens=params.get("max_tokens", 4096),
+            max_tokens=_max_tokens,
             temperature=params.get("temperature"),
             guardrail_config=guardrail,
         )
