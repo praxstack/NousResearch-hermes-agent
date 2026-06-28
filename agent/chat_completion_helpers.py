@@ -2775,19 +2775,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             diag=request_client_holder.get("diag"),
                         )
                         _close_request_client_once("stream_mid_tool_retry_cleanup")
-                        if agent.api_mode == "anthropic_messages":
-                            try:
-                                agent._anthropic_client.close()
-                                agent._rebuild_anthropic_client()
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                agent._replace_primary_openai_client(
-                                    reason="stream_mid_tool_retry_pool_cleanup"
-                                )
-                            except Exception:
-                                pass
+                        try:
+                            agent._replace_primary_openai_client(
+                                reason="stream_mid_tool_retry_pool_cleanup"
+                            )
+                        except Exception:
+                            pass
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -2835,19 +2828,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             _close_request_client_once("stream_retry_cleanup")
                             # Also rebuild the primary client to purge
                             # any dead connections from the pool.
-                            if agent.api_mode == "anthropic_messages":
-                                try:
-                                    agent._anthropic_client.close()
-                                    agent._rebuild_anthropic_client()
-                                except Exception:
-                                    pass
-                            else:
-                                try:
-                                    agent._replace_primary_openai_client(
-                                        reason="stream_retry_pool_cleanup"
-                                    )
-                                except Exception:
-                                    pass
+                            try:
+                                agent._replace_primary_openai_client(
+                                    reason="stream_retry_pool_cleanup"
+                                )
+                            except Exception:
+                                pass
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
