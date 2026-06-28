@@ -2775,12 +2775,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             diag=request_client_holder.get("diag"),
                         )
                         _close_request_client_once("stream_mid_tool_retry_cleanup")
-                        try:
-                            agent._replace_primary_openai_client(
-                                reason="stream_mid_tool_retry_pool_cleanup"
-                            )
-                        except Exception:
-                            pass
+                        # On the anthropic_messages transport there is no
+                        # per-request OpenAI client to replace (it no-ops) and
+                        # closing the SHARED _anthropic_client would poison the
+                        # httpx pool for concurrent sessions (council 2026-06-04
+                        # + #28161 reconciliation). Abort just the in-flight
+                        # MessageStream response instead — that unblocks the
+                        # worker read so it can retry on a fresh stream.
+                        if agent.api_mode == "anthropic_messages":
+                            try:
+                                _close_anthropic_stream_once("retry")
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                agent._replace_primary_openai_client(
+                                    reason="stream_mid_tool_retry_pool_cleanup"
+                                )
+                            except Exception:
+                                pass
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -2826,14 +2839,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             )
                             # Close the stale request client before retry
                             _close_request_client_once("stream_retry_cleanup")
-                            # Also rebuild the primary client to purge
-                            # any dead connections from the pool.
-                            try:
-                                agent._replace_primary_openai_client(
-                                    reason="stream_retry_pool_cleanup"
-                                )
-                            except Exception:
-                                pass
+                            # anthropic_messages: abort the in-flight MessageStream
+                            # response (not the shared client — pool-poison under
+                            # concurrent sessions; council 2026-06-04 + #28161).
+                            # _replace_primary_openai_client no-ops in anthropic mode.
+                            if agent.api_mode == "anthropic_messages":
+                                try:
+                                    _close_anthropic_stream_once("retry")
+                                except Exception:
+                                    pass
+                            else:
+                                # Rebuild the primary client to purge any dead
+                                # connections from the pool.
+                                try:
+                                    agent._replace_primary_openai_client(
+                                        reason="stream_retry_pool_cleanup"
+                                    )
+                                except Exception:
+                                    pass
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,

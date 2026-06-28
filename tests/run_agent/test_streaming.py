@@ -1181,11 +1181,15 @@ class TestAnthropicStreamCallbacks:
 
         assert response is final_message
         assert agent._anthropic_client.messages.stream.call_count == 2
-        # Anthropic-native cleanup: close + rebuild the Anthropic client, never
-        # the OpenAI primary client.
+        # Anthropic-native cleanup (council reconciliation 2026-06-28): abort the
+        # in-flight MessageStream response via _close_anthropic_stream_once —
+        # never _replace_primary_openai_client (no-ops in anthropic mode -> the
+        # #28161 hang) and never close/rebuild the SHARED client (pool-poison
+        # under concurrent sessions). The retry still succeeds + delivers the
+        # final message, which is the behavior #28161 actually cared about.
         assert mock_replace.call_count == 0
-        assert mock_rebuild.call_count == 1
-        assert agent._anthropic_client.close.call_count == 1
+        assert mock_rebuild.call_count == 0
+        assert agent._anthropic_client.close.call_count == 0
 
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     def test_generic_anthropic_valueerror_still_propagates_without_stream_retry(
