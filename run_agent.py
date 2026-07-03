@@ -288,20 +288,26 @@ def _routermint_headers() -> dict:
     }
 
 
-def _pool_may_recover_from_rate_limit(pool) -> bool:
+def _pool_may_recover_from_rate_limit(
+    pool, *, provider: str | None = None, base_url: str | None = None
+) -> bool:
     """Decide whether to wait for credential-pool rotation instead of falling back.
 
     The existing pool-rotation path requires the pool to (1) exist and (2) have
     at least one entry not currently in exhaustion cooldown.  But rotation is
     only meaningful when the pool has more than one entry.
 
-    With a single-credential pool (common for Vertex service accounts and any
-    "one personal key" configuration), the primary entry just 429'd and there
-    is nothing to rotate to.  Waiting for the pool cooldown to expire means
-    retrying against the same exhausted quota — the daily-quota 429 will recur
-    immediately, and the retry budget is burned.
+    With a single-credential pool (common for Gemini OAuth, Vertex service
+    accounts, and any "one personal key" configuration), the primary entry
+    just 429'd and there is nothing to rotate to.  Waiting for the pool
+    cooldown to expire means retrying against the same exhausted quota — the
+    daily-quota 429 will recur immediately, and the retry budget is burned.
 
-    In that case we must fall back to the configured ``fallback_model``
+    Additionally, Google CloudCode / Gemini CLI rate limits are ACCOUNT-level
+    throttles — even a multi-entry pool shares the same quota window, so
+    rotation won't recover.  Skip straight to the fallback for those (#13636).
+
+    In those cases we must fall back to the configured ``fallback_model``
     instead.  Returns True only when rotation has somewhere to go.
 
     See issues #11314 and #13636.
@@ -309,6 +315,18 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
     if pool is None:
         return False
     if not pool.has_available():
+        return False
+    # CloudCode / Gemini CLI quotas are account-wide — all pool entries share
+    # the same throttle window, so rotation can't recover.  Prefer fallback.
+    if str(base_url or "").startswith("cloudcode-pa://"):
+        return False
+    # log-sweep F9 (2026-07-03): ChatGPT-subscription Codex (chatgpt.com/
+    # backend-api/codex) surfaces `usage_limit_reached` — a PLAN-level quota
+    # (plan_type:plus, resets_in_seconds ~hours) shared by every credential on
+    # the same account. Rotating the pool retries the same exhausted plan
+    # window and burns the retry budget on a quota that won't clear for hours;
+    # skip straight to the fallback model, exactly like the CloudCode case.
+    if "chatgpt.com/backend-api/codex" in str(base_url or ""):
         return False
     return len(pool.entries()) > 1
 
@@ -4525,6 +4543,13 @@ class AIAgent:
         """Whether a rate-limit retry should wait for same-provider credentials."""
         pool = self._credential_pool
         if pool is None:
+            return False
+        if (
+            str(getattr(self, "base_url", "")).startswith("cloudcode-pa://")
+        ):
+            # CloudCode/Gemini quota windows are usually account-level throttles.
+            # Prefer the configured fallback immediately instead of waiting out
+            # Retry-After while a pooled OAuth credential may still appear usable.
             return False
         return pool.has_available()
 
