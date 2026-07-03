@@ -2693,7 +2693,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # this return value is discarded anyway.
                 if agent._interrupt_requested:
                     return None
-                return stream.get_final_message()
+                # PRAX-PATCH 2026-07-03 (log-sweep F-stream): fable-5 under
+                # capacity pressure sometimes opens a 200 stream then drops it
+                # before emitting `message_start`. The SDK's get_final_message()
+                # then trips a message-less `assert __final_message_snapshot is
+                # not None`, surfacing as an opaque empty AssertionError that the
+                # main loop can't classify as transient — so it burns all
+                # same-rung retries and strands the session on the opus fallback
+                # rung for its remainder. Convert that specific case into a
+                # RemoteProtocolError (server closed stream early) so it routes
+                # through the existing _is_conn_err retry path: retry fable first,
+                # and if it truly persists, fall back with a readable reason.
+                try:
+                    return stream.get_final_message()
+                except AssertionError as _assert_e:
+                    import httpx as _httpx
+                    raise _httpx.RemoteProtocolError(
+                        "stream closed before message_start "
+                        "(no final message snapshot — provider dropped the "
+                        "stream after opening it)"
+                    ) from _assert_e
             finally:
                 # Always clear the registered handle so a later attempt /
                 # the watchdog never closes a dead stream from this attempt.
