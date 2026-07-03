@@ -45,6 +45,17 @@ def test_non_cloudcode_multi_entry_pool_still_recovers():
     ) is True
 
 
+def test_codex_chatgpt_subscription_skips_pool_rotation():
+    # log-sweep F9: ChatGPT-sub Codex usage_limit_reached is a plan-level quota
+    # (resets in hours) shared across the account — rotating the pool can't
+    # recover it, so prefer fallback immediately, like CloudCode.
+    assert _pool_may_recover_from_rate_limit(
+        _pool(entries=3),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex/",
+    ) is False
+
+
 def test_single_entry_pool_skips_rotation_regardless_of_provider():
     # Pre-existing single-entry-pool exception (#11314) still holds.
     assert _pool_may_recover_from_rate_limit(

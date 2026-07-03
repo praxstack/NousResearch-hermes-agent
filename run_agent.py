@@ -320,6 +320,14 @@ def _pool_may_recover_from_rate_limit(
     # the same throttle window, so rotation can't recover.  Prefer fallback.
     if str(base_url or "").startswith("cloudcode-pa://"):
         return False
+    # log-sweep F9 (2026-07-03): ChatGPT-subscription Codex (chatgpt.com/
+    # backend-api/codex) surfaces `usage_limit_reached` — a PLAN-level quota
+    # (plan_type:plus, resets_in_seconds ~hours) shared by every credential on
+    # the same account. Rotating the pool retries the same exhausted plan
+    # window and burns the retry budget on a quota that won't clear for hours;
+    # skip straight to the fallback model, exactly like the CloudCode case.
+    if "chatgpt.com/backend-api/codex" in str(base_url or ""):
+        return False
     return len(pool.entries()) > 1
 
 
