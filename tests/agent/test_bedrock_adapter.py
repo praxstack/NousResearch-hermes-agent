@@ -439,6 +439,47 @@ class TestConvertMessagesToConverse:
         assert len(image_blocks) == 1
         assert image_blocks[0]["image"]["format"] == "png"
 
+    def test_image_data_url_decoded_to_raw_bytes(self):
+        """boto3 Converse needs RAW bytes in image.source.bytes — passing the
+        base64 string through fails ParamValidation (fixed 2026-07-04)."""
+        import base64 as _b64
+        from agent.bedrock_adapter import convert_messages_to_converse
+        raw = b"\x89PNG\r\n\x1a\nfakepixels"
+        url = "data:image/png;base64," + _b64.b64encode(raw).decode()
+        messages = [{
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": url}}],
+        }]
+        _, msgs = convert_messages_to_converse(messages)
+        img = [b for b in msgs[0]["content"] if "image" in b][0]["image"]
+        assert img["source"]["bytes"] == raw
+        assert isinstance(img["source"]["bytes"], bytes)
+
+    def test_image_jpg_format_normalized_to_jpeg(self):
+        import base64 as _b64
+        from agent.bedrock_adapter import convert_messages_to_converse
+        url = "data:image/jpg;base64," + _b64.b64encode(b"\xff\xd8jj").decode()
+        messages = [{
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": url}}],
+        }]
+        _, msgs = convert_messages_to_converse(messages)
+        img = [b for b in msgs[0]["content"] if "image" in b][0]["image"]
+        assert img["format"] == "jpeg"
+
+    def test_image_invalid_base64_degrades_to_text(self):
+        from agent.bedrock_adapter import convert_messages_to_converse
+        messages = [{
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {
+                "url": "data:image/png;base64,!!!not-base64!!!",
+            }}],
+        }]
+        _, msgs = convert_messages_to_converse(messages)
+        content = msgs[0]["content"]
+        assert not any("image" in b for b in content)
+        assert any("invalid base64" in b.get("text", "") for b in content)
+
     def test_multiple_system_messages_merged(self):
         from agent.bedrock_adapter import convert_messages_to_converse
         messages = [
