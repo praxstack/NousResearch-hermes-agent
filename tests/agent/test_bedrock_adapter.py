@@ -453,6 +453,128 @@ class TestConvertMessagesToConverse:
         assert system[1]["text"] == "Rule 2"
 
 
+class TestNoWhitespaceOnlyTextBlocks:
+    """Converse rejects whitespace-only text blocks fleet-wide (enforced
+    model-side since ~2026-06: 'messages: text content blocks must contain
+    non-whitespace text').  A single blank block poisons the request for
+    EVERY model in EVERY region, so the fallback chain burns through all
+    entries futilely.  Live incident: session cd0074 + cognify cron
+    2026-06-30.  Invariant: no text block emitted by the converter may be
+    empty or whitespace-only — filler must carry non-whitespace text.
+    """
+
+    @staticmethod
+    def _assert_no_blank_text(system, msgs):
+        def walk_blocks(blocks):
+            for b in blocks:
+                if "text" in b:
+                    assert isinstance(b["text"], str) and b["text"].strip(), (
+                        f"whitespace-only text block leaked: {b!r}"
+                    )
+                if "toolResult" in b:
+                    walk_blocks(b["toolResult"].get("content", []))
+        for blk in system or []:
+            assert blk.get("text", "x").strip(), f"blank system block: {blk!r}"
+        for m in msgs:
+            walk_blocks(m.get("content", []))
+
+    def test_assistant_empty_content_with_tool_calls(self):
+        # The exact incident shape: assistant turns with content='' + tool_calls.
+        from agent.bedrock_adapter import convert_messages_to_converse
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "terminal", "arguments": '{"command": "ls"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "t1", "content": "ok"},
+        ]
+        system, msgs = convert_messages_to_converse(messages)
+        self._assert_no_blank_text(system, msgs)
+
+    def test_whitespace_only_user_content(self):
+        from agent.bedrock_adapter import convert_messages_to_converse
+        for blank in ["", " ", "\n\n", "\t \n"]:
+            system, msgs = convert_messages_to_converse(
+                [{"role": "user", "content": blank}]
+            )
+            self._assert_no_blank_text(system, msgs)
+            assert msgs, "user message must not vanish entirely"
+
+    def test_whitespace_only_list_parts_dropped(self):
+        from agent.bedrock_adapter import convert_messages_to_converse
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "  \n"},
+                {"type": "text", "text": "real question"},
+                "   ",
+            ],
+        }]
+        system, msgs = convert_messages_to_converse(messages)
+        self._assert_no_blank_text(system, msgs)
+        texts = [b["text"] for b in msgs[0]["content"] if "text" in b]
+        assert texts == ["real question"]
+
+    def test_all_blank_list_parts_get_filler(self):
+        from agent.bedrock_adapter import convert_messages_to_converse
+        messages = [{
+            "role": "user",
+            "content": [{"type": "text", "text": " "}, {"type": "text", "text": "\n"}],
+        }]
+        system, msgs = convert_messages_to_converse(messages)
+        self._assert_no_blank_text(system, msgs)
+        assert len(msgs[0]["content"]) == 1  # collapsed to one filler block
+
+    def test_blank_tool_result_gets_filler(self):
+        from agent.bedrock_adapter import convert_messages_to_converse
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "noop", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "t1", "content": "  "},
+        ]
+        system, msgs = convert_messages_to_converse(messages)
+        self._assert_no_blank_text(system, msgs)
+
+    def test_blank_system_parts_skipped(self):
+        from agent.bedrock_adapter import convert_messages_to_converse
+        messages = [
+            {"role": "system", "content": [
+                {"type": "text", "text": "  "},
+                {"type": "text", "text": "Real rule"},
+                "\n",
+            ]},
+            {"role": "user", "content": "hi"},
+        ]
+        system, msgs = convert_messages_to_converse(messages)
+        self._assert_no_blank_text(system, msgs)
+        assert system is not None
+        assert [b["text"] for b in system] == ["Real rule"]
+
+    def test_alternation_fillers_are_nonblank(self):
+        # First/last-message fillers injected for strict alternation.
+        from agent.bedrock_adapter import convert_messages_to_converse
+        messages = [{
+            "role": "assistant",
+            "content": "starts with assistant",
+        }]
+        system, msgs = convert_messages_to_converse(messages)
+        self._assert_no_blank_text(system, msgs)
+        assert msgs[0]["role"] == "user"
+        assert msgs[-1]["role"] == "user"
+
+
 # ---------------------------------------------------------------------------
 # Response normalization: Converse → OpenAI
 # ---------------------------------------------------------------------------
@@ -1569,22 +1691,30 @@ class TestBedrockSamplingParamGuard:
 
 
 class TestEmptyTextBlockFix:
-    """Test that empty text blocks are replaced with space placeholders."""
+    """Empty text blocks must be replaced with NON-WHITESPACE filler.
 
-    def test_none_content_gets_space(self):
+    Historical note: these tests originally asserted a single-space filler
+    (" "), but Bedrock now rejects whitespace-only text model-side
+    ("messages: text content blocks must contain non-whitespace text",
+    live-reproduced 2026-07-03) — a space placeholder poisons the request
+    for every model/region. The invariant is now: filler exists AND carries
+    non-whitespace text.
+    """
+
+    def test_none_content_gets_nonblank_filler(self):
         from agent.bedrock_adapter import _convert_content_to_converse
         blocks = _convert_content_to_converse(None)
-        assert blocks[0]["text"] == " "
+        assert blocks and blocks[0]["text"].strip()
 
-    def test_empty_string_gets_space(self):
+    def test_empty_string_gets_nonblank_filler(self):
         from agent.bedrock_adapter import _convert_content_to_converse
         blocks = _convert_content_to_converse("")
-        assert blocks[0]["text"] == " "
+        assert blocks and blocks[0]["text"].strip()
 
-    def test_whitespace_only_gets_space(self):
+    def test_whitespace_only_gets_nonblank_filler(self):
         from agent.bedrock_adapter import _convert_content_to_converse
         blocks = _convert_content_to_converse("   ")
-        assert blocks[0]["text"] == " "
+        assert blocks and blocks[0]["text"].strip()
 
     def test_real_text_preserved(self):
         from agent.bedrock_adapter import _convert_content_to_converse

@@ -1177,6 +1177,17 @@ def convert_tools_to_converse(tools: List[Dict]) -> List[Dict]:
     return result
 
 
+# Non-whitespace filler for structurally-required content blocks.  Converse
+# rejects BOTH empty text fields ("The text field in the ContentBlock object
+# ... is blank") AND whitespace-only text ("messages: text content blocks
+# must contain non-whitespace text" — enforced model-side since ~2026-06).
+# The old single-space filler ({"text": " "}) now poisons the entire request:
+# every model in every region rejects the payload, so fallback chains burn
+# through all entries futilely.  Live-reproduced 2026-07-03 (session cd0074 +
+# cognify cron 2026-06-30).  Any filler MUST contain non-whitespace text.
+_NONBLANK_FILLER = "(no content)"
+
+
 def _convert_content_to_converse(content) -> List[Dict]:
     """Convert OpenAI message content (string or list) to Converse content blocks.
 
@@ -1184,26 +1195,34 @@ def _convert_content_to_converse(content) -> List[Dict]:
       - Plain text strings → [{"text": "..."}]
       - Content arrays with text/image_url parts → mixed text/image blocks
 
-    Filters out empty text blocks — Bedrock's Converse API rejects messages
-    where a text content block has an empty ``text`` field (ValidationException:
-    "text content blocks must be non-empty"). Ref: issue #9486.
+    Filters out empty/whitespace-only text blocks — Bedrock's Converse API
+    rejects blank text fields (ValidationException "text field ... is blank")
+    AND whitespace-only text ("text content blocks must contain non-whitespace
+    text"). Ref: issue #9486 + session-poisoning incident 2026-07-03.
     """
     if content is None:
-        return [{"text": " "}]
+        return [{"text": _NONBLANK_FILLER}]
     if isinstance(content, str):
-        return [{"text": content}] if content.strip() else [{"text": " "}]
+        return [{"text": content}] if content.strip() else [{"text": _NONBLANK_FILLER}]
     if isinstance(content, list):
         blocks = []
         for part in content:
             if isinstance(part, str):
-                blocks.append({"text": part})
+                if part.strip():
+                    blocks.append({"text": part})
                 continue
             if not isinstance(part, dict):
                 continue
             part_type = part.get("type", "")
             if part_type == "text":
                 text = part.get("text", "")
-                blocks.append({"text": text if text else " "})
+                if isinstance(text, str) and not text.strip():
+                    # Drop whitespace-only text parts entirely; other parts
+                    # (images, later text) may still carry the message. The
+                    # blocks-empty fallback below guarantees a valid filler
+                    # when nothing survives.
+                    continue
+                blocks.append({"text": text})
             elif part_type == "image_url":
                 image_url = part.get("image_url", {})
                 url = image_url.get("url", "") if isinstance(image_url, dict) else ""
@@ -1225,7 +1244,7 @@ def _convert_content_to_converse(content) -> List[Dict]:
                     # Remote URL — Converse doesn't support URLs directly,
                     # include as text reference for the model.
                     blocks.append({"text": f"[Image: {url}]"})
-        return blocks if blocks else [{"text": " "}]
+        return blocks if blocks else [{"text": _NONBLANK_FILLER}]
     return [{"text": str(content)}]
 
 
@@ -1256,14 +1275,17 @@ def convert_messages_to_converse(
         content = msg.get("content")
 
         if role == "system":
-            # System messages become the system prompt
+            # System messages become the system prompt.  Skip blank parts —
+            # Converse rejects whitespace-only text blocks in system too.
             if isinstance(content, str) and content.strip():
                 system_blocks.append({"text": content})
             elif isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
-                        system_blocks.append({"text": part.get("text", "")})
-                    elif isinstance(part, str):
+                        _sys_text = part.get("text", "")
+                        if isinstance(_sys_text, str) and _sys_text.strip():
+                            system_blocks.append({"text": _sys_text})
+                    elif isinstance(part, str) and part.strip():
                         system_blocks.append({"text": part})
             continue
 
@@ -1271,6 +1293,10 @@ def convert_messages_to_converse(
             # Tool result messages → merge into the preceding user turn
             tool_call_id = msg.get("tool_call_id", "")
             result_content = content if isinstance(content, str) else json.dumps(content)
+            if not (isinstance(result_content, str) and result_content.strip()):
+                # Blank toolResult text is rejected by Converse the same way
+                # blank message text is — guard with a non-whitespace filler.
+                result_content = _NONBLANK_FILLER
             tool_result_block = {
                 "toolResult": {
                     "toolUseId": tool_call_id,
@@ -1313,7 +1339,7 @@ def convert_messages_to_converse(
                 })
 
             if not content_blocks:
-                content_blocks = [{"text": " "}]
+                content_blocks = [{"text": _NONBLANK_FILLER}]
 
             # Merge with previous assistant message if needed (strict alternation)
             if converse_msgs and converse_msgs[-1]["role"] == "assistant":
@@ -1339,11 +1365,11 @@ def convert_messages_to_converse(
 
     # Converse requires the first message to be from the user
     if converse_msgs and converse_msgs[0]["role"] != "user":
-        converse_msgs.insert(0, {"role": "user", "content": [{"text": " "}]})
+        converse_msgs.insert(0, {"role": "user", "content": [{"text": _NONBLANK_FILLER}]})
 
     # Converse requires the last message to be from the user
     if converse_msgs and converse_msgs[-1]["role"] != "user":
-        converse_msgs.append({"role": "user", "content": [{"text": " "}]})
+        converse_msgs.append({"role": "user", "content": [{"text": _NONBLANK_FILLER}]})
 
     return (system_blocks if system_blocks else None, converse_msgs)
 
