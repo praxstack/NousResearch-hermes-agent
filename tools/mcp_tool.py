@@ -323,7 +323,7 @@ _MCP_LOG_LEVEL_MAP = {
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
-_MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
+_MAX_INITIAL_CONNECT_RETRIES = 6 # retries for the very first connection attempt (log-sweep F3, 2026-07-03: bumped 3→6 so a cold HTTP MCP daemon — e.g. cognee-mcp-http binding :8126 at fleet boot — gets a ~63s window (1+2+4+8+16+32s) instead of ~7s; fixes the 30x "Connect call failed 127.0.0.1" boot-race that fired when 8 gateways raced a still-starting daemon during the wake/restart cascade)
 _MAX_BACKOFF_SECONDS = 60
 # While parked (reconnect budget exhausted, tools deregistered) the run task
 # wakes on this cadence and attempts one revival probe. Without it a parked
