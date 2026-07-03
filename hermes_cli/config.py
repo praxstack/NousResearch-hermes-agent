@@ -136,6 +136,45 @@ def _warn_config_parse_failure(config_path: Path, exc: Exception) -> None:
         sys.stderr.flush()
     except Exception:
         pass
+    # log-sweep F10 (2026-07-03): a silent fallback means a whole desktop/gateway
+    # session runs with EVERY provider/model override ignored — the user never
+    # sees the stderr line. Fire one best-effort loud alert (macOS notification;
+    # ntfy if configured) so a broken config can't run invisibly. Warn-once
+    # guard above already dedupes, so this fires at most once per broken file.
+    _alert_config_fallback_loudly(config_path, backup_path)
+
+
+def _alert_config_fallback_loudly(config_path, backup_path) -> None:
+    """Best-effort out-of-band alert on config parse-fallback. Never raises."""
+    short = (
+        f"config.yaml failed to parse — running on DEFAULTS, all overrides ignored. "
+        f"Fix + restart.{' Backup: ' + str(backup_path) if backup_path else ''}"
+    )
+    # macOS notification (the surface the user actually sees on desktop).
+    try:
+        if platform.system() == "Darwin":
+            import subprocess as _sp
+            _sp.run(
+                ["osascript", "-e",
+                 'display notification "{}" with title "Hermes config BROKEN" sound name "Basso"'
+                 .format(short.replace('"', "'")[:230])],
+                timeout=5, capture_output=True,
+            )
+    except Exception:
+        pass
+    # ntfy, if the user wired a topic (shared with the watchdog fleet).
+    try:
+        topic = os.environ.get("HERMES_NTFY_TOPIC") or os.environ.get("NTFY_TOPIC")
+        if topic:
+            import urllib.request as _u
+            req = _u.Request(
+                f"https://ntfy.sh/{topic}",
+                data=short.encode("utf-8"),
+                headers={"Title": "Hermes config BROKEN", "Priority": "high", "Tags": "warning"},
+            )
+            _u.urlopen(req, timeout=5).read()
+    except Exception:
+        pass
 
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
