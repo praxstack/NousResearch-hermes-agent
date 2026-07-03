@@ -239,3 +239,65 @@ def test_no_shared_anthropic_client_close_anywhere_in_helpers():
         "client mid-request poisons the pool for concurrent sessions. Rebuild "
         "(reassign) the client instead; never close it."
     )
+
+
+def test_empty_snapshot_assertion_converted_to_retryable_conn_error():
+    """log-sweep F-stream (2026-07-03): fable-5 under capacity load opens a 200
+    stream then drops it before `message_start`; the SDK's get_final_message()
+    trips a message-less AssertionError. The call site must convert that into an
+    httpx.RemoteProtocolError so the main loop classifies it as a transient
+    connection error (retry same rung → keep the pinned model) instead of an
+    opaque assertion that strands the session on the opus fallback rung.
+    """
+    import httpx
+
+    class _EmptySnapshotStream:
+        """Mimics the SDK stream whose get_final_message() asserts on a
+        never-populated __final_message_snapshot (no message_start seen)."""
+
+        def get_final_message(self):
+            # Bare, message-less assert — exactly what anthropic's
+            # lib/streaming/_messages.py:94 raises.
+            assert None is not None  # noqa: B011
+
+    # The conversion the call site performs, in isolation.
+    def _guarded_final(stream):
+        try:
+            return stream.get_final_message()
+        except AssertionError as _assert_e:
+            raise httpx.RemoteProtocolError(
+                "stream closed before message_start "
+                "(no final message snapshot — provider dropped the "
+                "stream after opening it)"
+            ) from _assert_e
+
+    with pytest.raises(httpx.RemoteProtocolError) as ei:
+        _guarded_final(_EmptySnapshotStream())
+    # Must carry a readable reason (the empty AssertionError had none) and
+    # preserve the original for diagnostics.
+    assert "message_start" in str(ei.value)
+    assert isinstance(ei.value.__cause__, AssertionError)
+    # RemoteProtocolError is in the loop's _is_conn_err retryable tuple, so
+    # this routes to a same-rung retry, not an immediate fallback.
+    assert isinstance(ei.value, httpx.RemoteProtocolError)
+
+
+def test_get_final_message_assertion_guard_present_at_call_site():
+    """Source-level guard: the get_final_message() call must be wrapped so a
+    bare AssertionError becomes a classifiable transport error. Prevents a
+    refactor from silently reintroducing the opaque-assertion → sticky-opus bug.
+    """
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(here, "agent", "chat_completion_helpers.py")
+    with open(path, encoding="utf-8") as fh:
+        code = fh.read()
+    assert "except AssertionError as _assert_e:" in code, (
+        "get_final_message() is no longer guarded against the SDK's empty-"
+        "snapshot AssertionError — an early-dropped fable stream will surface "
+        "as an opaque assertion and strand the session on the opus fallback."
+    )
+    assert "RemoteProtocolError(" in code, (
+        "The AssertionError guard must re-raise as httpx.RemoteProtocolError so "
+        "the main loop's _is_conn_err classifier retries the pinned model."
+    )
