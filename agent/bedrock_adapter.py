@@ -613,6 +613,11 @@ _AWS_CREDENTIAL_ENV_VARS = [
     "AWS_WEB_IDENTITY_TOKEN_FILE",
 ]
 
+# log-sweep F8 (2026-07-03): dedupe the "competing IAM credential" WARNING so it
+# fires at most once per process per distinct competing-var set, instead of on
+# every Bedrock API call (was 1,812 identical lines/week in errors.log).
+_COMPETING_IAM_WARNED: set = set()
+
 _AWS_ENV_MASK_FOR_API_KEY = (
     # First entry: the bearer token itself — we OWN this for the duration of
     # the SDK call (set inside the contextmanager) and the contextmanager
@@ -915,16 +920,28 @@ def resolve_bedrock_auth_config(
             if str(env.get(k) or "").strip()
         ]
         if _competing_iam:
-            logger.warning(
-                "Bedrock auth_method=api_key but competing IAM credential "
-                "source(s) present in env: %s. The bearer token is persisted "
-                "process-wide and unmasked; this re-opens the NoAuthTokenError "
-                "mask race and the bearer token may shadow your IAM creds. "
-                "Either remove auth_method=api_key (use the IAM creds) or unset "
-                "the IAM env vars. See bedrock_adapter mask comments + the "
-                "2026-06-01 council review.",
-                ", ".join(_competing_iam),
-            )
+            # Warn-once-per-process-per-credential-set (log-sweep F8, 2026-07-03).
+            # resolve_bedrock_auth_config runs on EVERY Bedrock API call; the
+            # unconditional warning flooded errors.log with 1,812 identical lines
+            # in one week (every turn of every CLI session that inherited
+            # AWS_PROFILE=bedrock from its spawning shell). The condition is a
+            # process-lifetime invariant — the env doesn't change mid-process —
+            # so one warning per distinct competing-set is all the signal there
+            # is. Dedupe on the frozenset of offending var names.
+            global _COMPETING_IAM_WARNED
+            _key = frozenset(_competing_iam)
+            if _key not in _COMPETING_IAM_WARNED:
+                _COMPETING_IAM_WARNED.add(_key)
+                logger.warning(
+                    "Bedrock auth_method=api_key but competing IAM credential "
+                    "source(s) present in env: %s. The bearer token is persisted "
+                    "process-wide and unmasked; this re-opens the NoAuthTokenError "
+                    "mask race and the bearer token may shadow your IAM creds. "
+                    "Either remove auth_method=api_key (use the IAM creds) or unset "
+                    "the IAM env vars. See bedrock_adapter mask comments + the "
+                    "2026-06-01 council review. (warn-once-per-process)",
+                    ", ".join(_competing_iam),
+                )
         return {
             "method": "api_key",
             "region": region,
