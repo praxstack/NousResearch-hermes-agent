@@ -571,6 +571,18 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._drop_delayed_deliveries = False
         self._polling_error_task: Optional[asyncio.Task] = None
+        # log-sweep F7 (2026-07-03): serialize polling recovery. Three independent
+        # triggers can fire recovery concurrently — PTB's error_callback, the
+        # heartbeat probe (_polling_heartbeat_loop), and the pending-updates
+        # probe. Without a lock, two can both pass the `if updater.running:
+        # stop()` check and then both call start_polling(), the second raising
+        # "This Updater is already running!" — which the except branch turned
+        # into ANOTHER scheduled retry, escalating one race into a storm
+        # (10x "already running" + 12x "treating as wedged", 06-28..07-02).
+        # Holding this lock across the stop→drain→start_polling sequence makes
+        # recovery single-flight; "already running" then means a sibling already
+        # recovered and is treated as benign (see _handle_polling_network_error).
+        self._polling_recovery_lock = asyncio.Lock()
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
@@ -2052,6 +2064,35 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         await asyncio.sleep(delay)
 
+        # log-sweep F7 (2026-07-03): single-flight the stop→drain→start_polling
+        # sequence. If another recovery path (heartbeat probe, pending-updates
+        # probe, PTB error_callback) is already mid-reconnect, wait for it and
+        # then re-check whether polling is already live — if so, this trigger is
+        # redundant and we return benignly instead of racing a second
+        # start_polling() into a "This Updater is already running!" storm.
+        async with self._polling_recovery_lock:
+            _app_now = self._app
+            if (
+                _app_now is not None
+                and getattr(_app_now, "updater", None) is not None
+                and _app_now.updater.running
+                and not self._send_path_degraded
+            ):
+                # A concurrent recovery already brought polling back up and
+                # cleared the degraded flag. Nothing to do.
+                logger.info(
+                    "[%s] Telegram polling already recovered by a concurrent "
+                    "reconnect (attempt %d) — skipping redundant restart.",
+                    self.name, attempt,
+                )
+                self._polling_network_error_count = 0
+                return
+            await self._reconnect_polling_locked(attempt, error)
+
+    async def _reconnect_polling_locked(self, attempt: int, error: Exception) -> None:
+        """Perform the actual polling restart. MUST be called with
+        ``self._polling_recovery_lock`` held (log-sweep F7)."""
+
         # Capture a stable local reference: self._app can be reassigned to None
         # by a concurrent disconnect() while we're suspended across the awaits
         # below, and re-reading self._app after that point would silently swap
@@ -2135,6 +2176,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._background_tasks.add(probe)
                 probe.add_done_callback(self._background_tasks.discard)
         except Exception as retry_err:
+            # log-sweep F7 (2026-07-03): "This Updater is already running!" means
+            # PTB's updater is already polling — recovery effectively succeeded
+            # (a sibling path or a still-live updater). Treat it as benign: clear
+            # the counters and degraded flag instead of scheduling ANOTHER retry,
+            # which is exactly what turned a single reconnect race into the
+            # 10x-already-running / 12x-wedged storm. The recovery lock now makes
+            # this rare, but keep the guard as defense-in-depth for the case
+            # where PTB's own error_callback restarted polling between our
+            # running-check and start_polling().
+            if "already running" in str(retry_err).lower():
+                logger.info(
+                    "[%s] Telegram updater already running (attempt %d) — "
+                    "treating as recovered, not scheduling another retry.",
+                    self.name, attempt,
+                )
+                self._polling_network_error_count = 0
+                self._send_path_degraded = False
+                return
             safe_retry_error = _redact_telegram_error_text(retry_err)
             logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, safe_retry_error)
             # start_polling failed — polling is dead and no further error
