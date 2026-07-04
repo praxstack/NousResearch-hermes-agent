@@ -480,6 +480,33 @@ class TestConvertMessagesToConverse:
         assert not any("image" in b for b in content)
         assert any("invalid base64" in b.get("text", "") for b in content)
 
+    def test_video_data_url_decoded_to_raw_bytes(self):
+        """video_url parts map to Converse video blocks with RAW bytes."""
+        import base64 as _b64
+        from agent.bedrock_adapter import convert_messages_to_converse
+        raw = b"\x00\x00\x00\x18ftypmp42fakevideo"
+        url = "data:video/mp4;base64," + _b64.b64encode(raw).decode()
+        messages = [{
+            "role": "user",
+            "content": [{"type": "video_url", "video_url": {"url": url}}],
+        }]
+        _, msgs = convert_messages_to_converse(messages)
+        vid = [b for b in msgs[0]["content"] if "video" in b][0]["video"]
+        assert vid["format"] == "mp4"
+        assert vid["source"]["bytes"] == raw
+
+    def test_video_quicktime_normalized_to_mov(self):
+        import base64 as _b64
+        from agent.bedrock_adapter import convert_messages_to_converse
+        url = "data:video/quicktime;base64," + _b64.b64encode(b"mv").decode()
+        messages = [{
+            "role": "user",
+            "content": [{"type": "video_url", "video_url": {"url": url}}],
+        }]
+        _, msgs = convert_messages_to_converse(messages)
+        vid = [b for b in msgs[0]["content"] if "video" in b][0]["video"]
+        assert vid["format"] == "mov"
+
     def test_multiple_system_messages_merged(self):
         from agent.bedrock_adapter import convert_messages_to_converse
         messages = [
