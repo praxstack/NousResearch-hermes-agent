@@ -1495,6 +1495,35 @@ class TestBedrockErrorClassification:
 class TestBedrockContextLength:
     """Test Bedrock model context length lookup."""
 
+    def test_claude_fable_5_1m_variant_is_1m(self):
+        """Fable-5 with :1m suffix returns 1M context.
+
+        Regression (2026-07-04): fable-5 was promoted to fleet default on
+        2026-07-02 but never added to BEDROCK_CONTEXT_LENGTHS, so
+        ``global.anthropic.claude-fable-5:1m`` fell through to the 128K
+        unknown-model default. Sessions then ran a 1M model on a 128K
+        compression budget → threshold 96K < protected-tail size →
+        self-perpetuating compression thrash loop (incident
+        20260704_025638_2dc87c: 489 API calls, 112 compressions, 81 min
+        at 99% CPU)."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-fable-5:1m") == 1_000_000
+
+    def test_claude_fable_5_global_profile_1m_is_1m(self):
+        """The exact fleet-default string resolves to 1M."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("global.anthropic.claude-fable-5:1m") == 1_000_000
+
+    def test_claude_fable_5_regional_1m_is_1m(self):
+        """Regional inference-profile fable + :1m resolves to 1M."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("us.anthropic.claude-fable-5:1m") == 1_000_000
+
+    def test_claude_fable_5_default_is_200k(self):
+        """Fable-5 without :1m defaults to 200K like other Claude models."""
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-fable-5") == 200_000
+
     def test_claude_opus_4_8_default_is_200k(self):
         """Opus 4.8 on Bedrock defaults to 200K — 1M requires :1m suffix."""
         from agent.bedrock_adapter import get_bedrock_context_length

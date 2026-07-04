@@ -2265,6 +2265,8 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Bedrock serves these at 200K by default; the 1M variant (see below)
     # requires the ``context-1m-2025-08-07`` beta and is opted into via
     # the ``:1m`` suffix on the model ID (matches Cline's UX).
+    "anthropic.claude-fable-5":      200_000,
+    "anthropic.claude-fable":        200_000,
     "anthropic.claude-opus-4-8":     200_000,
     "anthropic.claude-opus-4-7":     200_000,
     "anthropic.claude-opus-4-6":     200_000,
@@ -2283,6 +2285,8 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Verified against Anthropic docs (Apr 28 2026):
     # https://docs.anthropic.com/en/docs/build-with-claude/context-windows
     # and Cline's bedrock.ts model catalog.
+    "anthropic.claude-fable-5:1m":         1_000_000,
+    "anthropic.claude-fable:1m":           1_000_000,
     "anthropic.claude-opus-4-8:1m":       1_000_000,
     "anthropic.claude-opus-4-7:1m":       1_000_000,
     "anthropic.claude-opus-4-6:1m":       1_000_000,
