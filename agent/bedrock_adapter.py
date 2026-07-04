@@ -1241,38 +1241,40 @@ def _convert_content_to_converse(content) -> List[Dict]:
                     # when nothing survives.
                     continue
                 blocks.append({"text": text})
-            elif part_type == "image_url":
-                image_url = part.get("image_url", {})
-                url = image_url.get("url", "") if isinstance(image_url, dict) else ""
+            elif part_type in ("image_url", "video_url"):
+                media_key = "image" if part_type == "image_url" else "video"
+                media_url = part.get(part_type, {})
+                url = media_url.get("url", "") if isinstance(media_url, dict) else ""
                 if url.startswith("data:"):
-                    # data:image/jpeg;base64,/9j/4AAQ...
+                    # data:image/jpeg;base64,/9j/... | data:video/mp4;base64,...
                     header, _, data = url.partition(",")
-                    media_type = "image/jpeg"
+                    media_type = "image/jpeg" if media_key == "image" else "video/mp4"
                     if header.startswith("data:"):
                         mime_part = header[5:].split(";")[0]
                         if mime_part:
                             media_type = mime_part
-                    # boto3 Converse requires RAW bytes in image.source.bytes
+                    # boto3 Converse requires RAW bytes in <media>.source.bytes
                     # (boto3 base64-encodes for the wire itself). Passing the
-                    # base64 str fails ParamValidation / corrupts the image.
+                    # base64 str fails ParamValidation / corrupts the payload.
                     try:
-                        img_bytes = base64.b64decode(data)
+                        media_bytes = base64.b64decode(data)
                     except Exception:
-                        blocks.append({"text": "[Image: invalid base64 data]"})
+                        blocks.append({"text": f"[{media_key.title()}: invalid base64 data]"})
                         continue
-                    fmt = media_type.split("/")[-1] if "/" in media_type else "jpeg"
-                    if fmt == "jpg":
-                        fmt = "jpeg"
+                    fmt = media_type.split("/")[-1] if "/" in media_type else ""
+                    fmt = {"jpg": "jpeg", "quicktime": "mov"}.get(fmt, fmt) or (
+                        "jpeg" if media_key == "image" else "mp4"
+                    )
                     blocks.append({
-                        "image": {
+                        media_key: {
                             "format": fmt,
-                            "source": {"bytes": img_bytes},
+                            "source": {"bytes": media_bytes},
                         }
                     })
                 else:
                     # Remote URL — Converse doesn't support URLs directly,
                     # include as text reference for the model.
-                    blocks.append({"text": f"[Image: {url}]"})
+                    blocks.append({"text": f"[{media_key.title()}: {url}]"})
         return blocks if blocks else [{"text": _NONBLANK_FILLER}]
     return [{"text": str(content)}]
 

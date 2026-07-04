@@ -1537,6 +1537,42 @@ _VIDEO_MIME_TYPES = {
 }
 
 _MAX_VIDEO_BASE64_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
+
+
+def _bedrock_native_video_analyze(video_path, user_prompt: str, model_id: str) -> str:
+    """Analyze a video via direct Bedrock Converse (Nova) with RAW bytes.
+
+    Why this exists: the generic auxiliary client's bedrock path is
+    Anthropic-only (Claude has no video input), and routing Nova through
+    LiteLLM's ``video_url`` translation was observed to DROP the payload —
+    the model answered from thin air (said "blue" for a solid-red probe).
+    Direct Converse with raw bytes is the verified-correct path.
+    """
+    from pathlib import Path as _P
+
+    from agent.bedrock_adapter import _get_bedrock_runtime_client
+
+    p = _P(video_path)
+    raw = p.read_bytes()
+    fmt = p.suffix.lstrip(".").lower() or "mp4"
+    fmt = {"qt": "mov", "quicktime": "mov", "m4v": "mp4"}.get(fmt, fmt)
+    region = (os.getenv("BEDROCK_REGION") or os.getenv("AWS_REGION") or "us-east-1").strip()
+    client = _get_bedrock_runtime_client(region)
+    resp = client.converse(
+        modelId=model_id,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"video": {"format": fmt, "source": {"bytes": raw}}},
+                {"text": user_prompt},
+            ],
+        }],
+        inferenceConfig={"maxTokens": 4000},
+    )
+    blocks = resp.get("output", {}).get("message", {}).get("content", [])
+    return "".join(b.get("text", "") for b in blocks if isinstance(b, dict)).strip()
+
+
 _VIDEO_SIZE_WARN_BYTES = 20 * 1024 * 1024
 
 
@@ -1698,6 +1734,36 @@ async def video_analyze_tool(
         if video_size_bytes > _VIDEO_SIZE_WARN_BYTES:
             logger.warning("Video is %.1f MB — may be slow or rejected", video_size_mb)
 
+        # Bedrock-native fast path: Nova / TwelveLabs video models must go
+        # through direct Converse with RAW bytes. The generic aux-client
+        # bedrock path is Claude-only, and LiteLLM's video_url translation
+        # was proven lossy (model answered without seeing the video).
+        _native_model = (model or "").strip()
+        if not _native_model:
+            try:
+                from hermes_cli.config import cfg_get as _cg, load_config as _lc
+                _vid_cfg = _cg(_lc(), "auxiliary", "video", default=None) or {}
+                if str(_vid_cfg.get("provider", "")).strip().lower() == "bedrock":
+                    _native_model = str(_vid_cfg.get("model", "")).strip()
+            except Exception:
+                pass
+        if _native_model and any(
+            t in _native_model.lower() for t in ("nova", "twelvelabs", "pegasus")
+        ):
+            analysis = await asyncio.to_thread(
+                _bedrock_native_video_analyze,
+                temp_video_path, user_prompt, _native_model,
+            )
+            result = {
+                "success": True,
+                "analysis": analysis or "The video could not be analyzed.",
+            }
+            debug_call_data["success"] = True
+            debug_call_data["model_used"] = _native_model
+            _debug.log_call("video_analyze_tool", debug_call_data)
+            _debug.save()
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
         video_data_url = _video_to_base64_data_url(temp_video_path, mime_type=detected_mime)
         data_size_mb = len(video_data_url) / (1024 * 1024)
 
@@ -1743,8 +1809,21 @@ async def video_analyze_tool(
         except Exception:
             pass
 
+        # Resolve as task "video" when the user configured auxiliary.video
+        # (provider/model/base_url) — video needs a video-capable backend
+        # (e.g. LiteLLM->Nova), and the vision path may resolve to an
+        # anthropic-compat endpoint that rejects video_url parts. Without an
+        # auxiliary.video block, keep the legacy "vision" resolution.
+        _video_task = "vision"
+        try:
+            from hermes_cli.config import cfg_get as _cfg_get, load_config as _load_config
+            if (_cfg_get(_load_config(), "auxiliary", "video", default=None) or {}).get("provider"):
+                _video_task = "video"
+        except Exception:
+            pass
+
         call_kwargs = {
-            "task": "vision",
+            "task": _video_task,
             "messages": messages,
             "temperature": vision_temperature,
             "max_tokens": 4000,
