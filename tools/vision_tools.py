@@ -1550,25 +1550,47 @@ def _bedrock_native_video_analyze(video_path, user_prompt: str, model_id: str) -
     """
     from pathlib import Path as _P
 
-    from agent.bedrock_adapter import _get_bedrock_runtime_client
+    from agent.bedrock_adapter import _get_bedrock_runtime_client, resolve_bedrock_region
 
     p = _P(video_path)
+    # (c) Size guard BEFORE reading into memory: Bedrock Converse inline `bytes`
+    # has a ~25 MB ceiling and the whole file is buffered in RAM. Refuse early
+    # with a clear message instead of an opaque server-side failure + a big alloc.
+    try:
+        _sz = p.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"native video analyze: cannot stat {p}: {exc}") from exc
+    if _sz > _VIDEO_SIZE_WARN_BYTES:
+        raise ValueError(
+            f"Video too large for native Converse: {_sz / (1024 * 1024):.1f} MB "
+            f"(inline limit ~{_VIDEO_SIZE_WARN_BYTES // (1024 * 1024)} MB). "
+            f"Compress/trim the video and retry."
+        )
     raw = p.read_bytes()
     fmt = p.suffix.lstrip(".").lower() or "mp4"
     fmt = {"qt": "mov", "quicktime": "mov", "m4v": "mp4"}.get(fmt, fmt)
-    region = (os.getenv("BEDROCK_REGION") or os.getenv("AWS_REGION") or "us-east-1").strip()
+    # (a) Resolve region via the canonical resolver (reads config bedrock.region),
+    # not raw os.getenv — otherwise this path silently diverges to us-east-1.
+    region = resolve_bedrock_region()
     client = _get_bedrock_runtime_client(region)
-    resp = client.converse(
-        modelId=model_id,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"video": {"format": fmt, "source": {"bytes": raw}}},
-                {"text": user_prompt},
-            ],
-        }],
-        inferenceConfig={"maxTokens": 4000},
-    )
+    # (b) Wrap converse: surface a clean classified error instead of a raw
+    # botocore stack trace propagating out of asyncio.to_thread.
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"video": {"format": fmt, "source": {"bytes": raw}}},
+                    {"text": user_prompt},
+                ],
+            }],
+            inferenceConfig={"maxTokens": 4000},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"native video Converse failed (model={model_id}, region={region}): {exc}"
+        ) from exc
     blocks = resp.get("output", {}).get("message", {}).get("content", [])
     return "".join(b.get("text", "") for b in blocks if isinstance(b, dict)).strip()
 
