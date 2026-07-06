@@ -145,7 +145,21 @@ def _warn_config_parse_failure(config_path: Path, exc: Exception) -> None:
 
 
 def _alert_config_fallback_loudly(config_path, backup_path) -> None:
-    """Best-effort out-of-band alert on config parse-fallback. Never raises."""
+    """Best-effort out-of-band alert on config parse-fallback. Never raises.
+
+    Suppressed under pytest / CI: the test suite deliberately loads dozens of
+    intentionally-broken sandbox configs (temp ``HERMES_HOME`` dirs), and each
+    one would otherwise fire a real macOS notification + ntfy POST, spamming a
+    developer's notification center during any test run that exercises config
+    loading. The F10 alert exists so a broken config can't run *invisibly* in a
+    live desktop/gateway session — a test harness is neither invisible nor a
+    real session, so the alert is pointless noise there. Detection uses
+    pytest's own ``PYTEST_CURRENT_TEST`` (set per-test by pytest itself) and the
+    conventional ``CI`` marker; the live warn-once stderr line + logger.warning
+    in the caller still fire, so nothing about real-config diagnostics changes.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("CI"):
+        return
     short = (
         f"config.yaml failed to parse — running on DEFAULTS, all overrides ignored. "
         f"Fix + restart.{' Backup: ' + str(backup_path) if backup_path else ''}"

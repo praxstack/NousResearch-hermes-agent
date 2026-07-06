@@ -150,3 +150,5 @@ openmemory.db
 openmemory.db-shm
 openmemory.db-wal
 .pi-lens/
+.hardening/
+.codegraph/
