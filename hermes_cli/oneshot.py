@@ -379,6 +379,23 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
+    # Wait for background MCP discovery (started by _prepare_agent_startup
+    # before run_oneshot is called) to land before AIAgent builds its tool
+    # snapshot. The interactive CLI does this in cli.py:get_tool_definitions
+    # (wait_for_mcp_discovery() before every tool build); oneshot/cron built
+    # the snapshot DIRECTLY via model_tools with no wait, so slow-cold-start
+    # MCP servers (serena/gitnexus/playwright, 2-4s) were absent from the
+    # turn-1 tool list in headless/cron runs. This is a bounded thread.join()
+    # capped by mcp_discovery_timeout — it returns the INSTANT discovery
+    # completes, so a fast/no-MCP run pays ~0s; only a genuinely slow-
+    # connecting server incurs the bounded wait. Non-fatal: on any error we
+    # proceed with whatever tools are already registered.
+    try:
+        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+        wait_for_mcp_discovery()
+    except Exception:
+        pass
+
     session_db = _create_session_db_for_oneshot()
     # Read the effective fallback chain from profile config so oneshot workers
     # honour the same merge semantics as interactive CLI and gateway sessions.
