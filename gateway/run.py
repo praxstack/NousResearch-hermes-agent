@@ -5735,16 +5735,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # exit) and there were no active agent sessions to interrupt. An
         # idle gateway restarting is not user-visible behaviour — don't
         # surface it unless an active session actually got cut off, OR the
-        # operator has explicitly opted into "always notify" (legacy
-        # behaviour) via HERMES_GATEWAY_ALWAYS_NOTIFY_HOME_ON_SHUTDOWN=1.
-        always_notify_home = os.environ.get(
+        # operator opted into "always notify" via config.yaml
+        # (gateway.always_notify_home_on_shutdown: true). The legacy
+        # HERMES_GATEWAY_ALWAYS_NOTIFY_HOME_ON_SHUTDOWN env var is kept as an
+        # internal back-compat bridge (config-vs-.env rubric: behavioral flags
+        # live in config.yaml; env is a bridge only).
+        always_notify_home = bool(
+            getattr(self.config, "always_notify_home_on_shutdown", False)
+        ) or os.environ.get(
             "HERMES_GATEWAY_ALWAYS_NOTIFY_HOME_ON_SHUTDOWN", ""
         ).lower() in ("1", "true", "yes")
         if not active and not always_notify_home:
             logger.debug(
                 "Skipping home-channel shutdown notification: no active "
-                "sessions to interrupt (set HERMES_GATEWAY_ALWAYS_NOTIFY_"
-                "HOME_ON_SHUTDOWN=1 to restore legacy behaviour)."
+                "sessions to interrupt (set gateway.always_notify_home_on_"
+                "shutdown: true in config.yaml to restore legacy behaviour)."
             )
             return
 

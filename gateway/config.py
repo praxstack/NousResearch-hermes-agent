@@ -684,6 +684,14 @@ class GatewayConfig:
     # raw passthrough.
     filter_silence_narration: bool = True
 
+    # Restore legacy "always notify the home channel on gateway shutdown" even
+    # when no active agent session was interrupted. Default False: an idle
+    # gateway restarting (watchdog kick, clean exit) is not user-visible, so we
+    # stay quiet. Set gateway.always_notify_home_on_shutdown: true in config.yaml
+    # to opt back in. (Migrated from the HERMES_GATEWAY_ALWAYS_NOTIFY_HOME_ON_
+    # SHUTDOWN env var per the config-vs-.env rubric; the env var still works as
+    # an internal bridge for back-compat.)
+    always_notify_home_on_shutdown: bool = False
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
@@ -810,6 +818,7 @@ class GatewayConfig:
             "write_sessions_json": self.write_sessions_json,
             "always_log_local": self.always_log_local,
             "filter_silence_narration": self.filter_silence_narration,
+            "always_notify_home_on_shutdown": self.always_notify_home_on_shutdown,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
             "group_sessions_per_user": self.group_sessions_per_user,
@@ -919,6 +928,9 @@ class GatewayConfig:
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
             filter_silence_narration=_coerce_bool(
                 data.get("filter_silence_narration"), True
+            ),
+            always_notify_home_on_shutdown=_coerce_bool(
+                data.get("always_notify_home_on_shutdown"), False
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
@@ -1075,6 +1087,11 @@ def load_gateway_config() -> GatewayConfig:
             if "filter_silence_narration" in yaml_cfg:
                 gw_data["filter_silence_narration"] = yaml_cfg[
                     "filter_silence_narration"
+                ]
+
+            if "always_notify_home_on_shutdown" in yaml_cfg:
+                gw_data["always_notify_home_on_shutdown"] = yaml_cfg[
+                    "always_notify_home_on_shutdown"
                 ]
 
             if "unauthorized_dm_behavior" in yaml_cfg:
