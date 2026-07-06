@@ -2583,3 +2583,44 @@ class TestBedrockTransportBuildKwargsMaxTokens:
             max_tokens=5000,
         )
         assert kwargs["inferenceConfig"]["maxTokens"] == 5000
+
+
+class TestSplitBedrock1mSuffix:
+    """Regression guard: split_bedrock_1m_suffix must strip :fast on the
+    no-:1m path (was returning the original un-stripped id → a bare …:fast
+    leaked onto the Converse wire → ValidationException). Cited 2026-07-07
+    hardening audit T1 P0-1."""
+
+    def test_fast_only_suffix_is_stripped(self):
+        from agent.bedrock_adapter import split_bedrock_1m_suffix
+        # THE bug: :fast with no :1m must strip to base, 1m flag False.
+        assert split_bedrock_1m_suffix("anthropic.claude-opus-4-6:fast") == (
+            "anthropic.claude-opus-4-6",
+            False,
+        )
+
+    def test_combined_1m_fast_suffix(self):
+        from agent.bedrock_adapter import split_bedrock_1m_suffix
+        assert split_bedrock_1m_suffix("anthropic.claude-opus-4-6:1m:fast") == (
+            "anthropic.claude-opus-4-6",
+            True,
+        )
+
+    def test_one_m_suffix_only(self):
+        from agent.bedrock_adapter import split_bedrock_1m_suffix
+        assert split_bedrock_1m_suffix("us.anthropic.claude-opus-4-7:1m") == (
+            "us.anthropic.claude-opus-4-7",
+            True,
+        )
+
+    def test_bare_id_unchanged(self):
+        from agent.bedrock_adapter import split_bedrock_1m_suffix
+        assert split_bedrock_1m_suffix("global.anthropic.claude-fable-5") == (
+            "global.anthropic.claude-fable-5",
+            False,
+        )
+
+    def test_non_string_is_passthrough(self):
+        from agent.bedrock_adapter import split_bedrock_1m_suffix
+        # Defensive non-str guard (bedrock_adapter.py:581-582) — intentional.
+        assert split_bedrock_1m_suffix(None) == (None, False)  # type: ignore[arg-type]
