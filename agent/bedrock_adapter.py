@@ -587,8 +587,10 @@ def split_bedrock_1m_suffix(model_id: str) -> tuple:
         working = working[: -len(_FAST_SUFFIX)]
     if working.endswith(CLAUDE_1M_SUFFIX):
         return working[: -len(CLAUDE_1M_SUFFIX)], True
-    # Nothing stripped → return the original id unchanged.
-    return model_id, False
+    # No :1m suffix. Return ``working`` (not ``model_id``) so a :fast-only id
+    # has its :fast stripped per the docstring contract — otherwise a bare
+    # ``…:fast`` leaks onto the Bedrock Converse wire and 400s (ValidationException).
+    return working, False
 
 
 def is_claude_1m_capable_model(model_id: str) -> bool:
