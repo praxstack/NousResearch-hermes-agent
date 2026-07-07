@@ -168,10 +168,15 @@ def _alert_config_fallback_loudly(config_path, backup_path) -> None:
     try:
         if platform.system() == "Darwin":
             import subprocess as _sp
+            # Escape for embedding in an AppleScript string literal: backslash
+            # FIRST (so we don't double-escape the quotes we add next), then the
+            # double-quote. `short` embeds a filesystem path (backup_path) which
+            # can legitimately contain either char — unescaped, a crafted/odd
+            # path could break out of the string literal (AppleScript injection).
+            _msg = short.replace("\\", "\\\\").replace('"', '\\"')[:230]
             _sp.run(
                 ["osascript", "-e",
-                 'display notification "{}" with title "Hermes config BROKEN" sound name "Basso"'
-                 .format(short.replace('"', "'")[:230])],
+                 f'display notification "{_msg}" with title "Hermes config BROKEN" sound name "Basso"'],
                 timeout=5, capture_output=True,
             )
     except Exception:
