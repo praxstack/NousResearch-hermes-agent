@@ -3314,6 +3314,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback
 
+                if not is_reconnect:
+                    # Cold start (first boot, crash+KeepAlive relaunch, watchdog
+                    # kickstart) drops any Bot API updates queued while the bot
+                    # was down. Intentional for a genuine first boot (#46621),
+                    # but on a crash-restart it silently discards real messages —
+                    # log it so the discard is observable, not invisible.
+                    logger.warning(
+                        "[%s] Cold Telegram start: dropping any pending Bot API "
+                        "updates queued while offline (drop_pending_updates=True). "
+                        "Messages sent during downtime are discarded.",
+                        self.name,
+                    )
                 polling_started = await self._start_polling_resilient(
                     # On a cold first boot drop the stale Bot API queue; on a
                     # watcher reconnect after an outage preserve it so messages
