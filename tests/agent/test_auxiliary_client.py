@@ -718,15 +718,32 @@ class TestBedrockAuxiliaryClient:
         assert isinstance(client, AsyncAnthropicAuxiliaryClient)
         assert model == "anthropic.claude-sonnet-4-20250514-v1:0"
 
-    def test_bedrock_non_claude_returns_none_without_unhandled_warning(self, caplog):
-        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+    def test_bedrock_non_claude_resolves_converse_shim(self, caplog):
+        # Upstream (2026-06) added a Converse-API shim for non-Claude Bedrock
+        # models (Nova, Llama, gpt-oss …) — merged into the fork's native
+        # bearer-auth path at the 2026-07-08 rebase. Non-Claude no longer
+        # returns None; it resolves a BedrockAuxiliaryClient.
+        auth_config = {
+            "method": "api_key",
+            "region": "us-east-1",
+            "api_key": "***",
+            "cache_identity": "api_key:test",
+        }
+        with patch(
+            "agent.bedrock_adapter.resolve_bedrock_auth_config",
+            return_value=auth_config,
+        ), patch(
+            "agent.bedrock_adapter.has_aws_credentials", return_value=True,
+        ), caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
             client, model = resolve_provider_client(
                 "bedrock",
                 "amazon.nova-pro-v1:0",
             )
 
-        assert client is None
-        assert model is None
+        from agent.auxiliary_client import BedrockAuxiliaryClient
+
+        assert isinstance(client, BedrockAuxiliaryClient)
+        assert model == "amazon.nova-pro-v1:0"
         assert not any("unhandled auth_type aws_sdk" in rec.message for rec in caplog.records)
 
 
